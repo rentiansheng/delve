@@ -22,6 +22,7 @@ var DelveVersion = Version{
 
 func (v Version) String() string {
 	fixBuild(&v)
+	v.Build += " special: remote"
 	ver := fmt.Sprintf("Version: %s.%s.%s", v.Major, v.Minor, v.Patch)
 	if v.Metadata != "" {
 		ver += "-" + v.Metadata

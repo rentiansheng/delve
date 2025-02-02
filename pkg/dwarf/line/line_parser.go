@@ -251,6 +251,7 @@ func readFileEntry(info *DebugLineInfo, buf *bytes.Buffer, exitOnEmptyPath bool)
 			entry.Path = path.Join(info.IncludeDirs[entry.DirIdx], entry.Path)
 		}
 	}
+	entry.Path = wrapperBinaryCodeFile(entry.Path)
 
 	return entry
 }
