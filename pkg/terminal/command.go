@@ -78,12 +78,7 @@ type command struct {
 
 // Returns true if the command string matches one of the aliases for this command
 func (c command) match(cmdstr string) bool {
-	for _, v := range c.aliases {
-		if v == cmdstr {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(c.aliases, cmdstr)
 }
 
 // Commands represents the commands for Delve terminal process.
@@ -314,7 +309,7 @@ GROUPING
 	goloc: groups goroutines by the location of the go instruction that created the goroutine
 	startloc: groups goroutines by the location of the start function
 	running: groups goroutines by whether they are running or not
-	user: groups goroutines by weather they are user or runtime goroutines
+	user: groups goroutines by whether they are user or runtime goroutines
 
 
 Groups goroutines by the given location, running status or user classification, up to 5 goroutines per group will be displayed as well as the total number of goroutines in the group.
@@ -508,7 +503,7 @@ The command 'on x -edit' can be used to edit the list of commands executed when 
 
 Specifies that the breakpoint, tracepoint or watchpoint should break only if the boolean expression is true.
 
-See Documentation/cli/expr.md for a description of supported expressions.
+See Documentation/cli/expr.md for a description of supported expressions and Documentation/cli/cond.md for a description of how breakpoint conditions are evaluated.
 
 With the -hitcount option a condition on the breakpoint hit count can be set, the following operators are supported
 
@@ -574,7 +569,11 @@ Adds, removes or clears debug-info-directories.`},
 	edit [locspec]
 	
 If locspec is omitted edit will open the current source file in the editor, otherwise it will open the specified location.`},
-		{aliases: []string{"libraries"}, cmdFn: libraries, helpMsg: `List loaded dynamic libraries`},
+		{aliases: []string{"libraries"}, cmdFn: libraries, helpMsg: `List loaded dynamic libraries.
+	
+	libraries [-d N]
+
+If used with the -d option it will re-attempt to download the debug symbols for library N, using debuginfod-find.`},
 
 		{aliases: []string{"examinemem", "x"}, group: dataCmds, cmdFn: examineMemoryCmd, helpMsg: `Examine raw memory at the given address.
 
@@ -770,11 +769,9 @@ func nullCommand(t *Term, ctx callContext, args string) error {
 func (c *Commands) help(t *Term, ctx callContext, args string) error {
 	if args != "" {
 		for _, cmd := range c.cmds {
-			for _, alias := range cmd.aliases {
-				if alias == args {
-					fmt.Fprintln(t.stdout, cmd.helpMsg)
-					return nil
-				}
+			if slices.Contains(cmd.aliases, args) {
+				fmt.Fprintln(t.stdout, cmd.helpMsg)
+				return nil
 			}
 		}
 		return errNoCmd
@@ -1351,12 +1348,9 @@ func parseOneRedirect(w []string, redirs *[3]string) ([]string, bool, error) {
 	prefixes := []string{"<", ">", "2>"}
 	names := []string{"stdin", "stdout", "stderr"}
 	if len(w) >= 2 {
-		for _, prefix := range prefixes {
-			if w[len(w)-2] == prefix {
-				w[len(w)-2] += w[len(w)-1]
-				w = w[:len(w)-1]
-				break
-			}
+		if slices.Contains(prefixes, w[len(w)-2]) {
+			w[len(w)-2] += w[len(w)-1]
+			w = w[:len(w)-1]
 		}
 	}
 	for i, prefix := range prefixes {
@@ -1800,7 +1794,6 @@ func formatBreakpointAttrs(prefix string, bp *api.Breakpoint, includeTrace bool)
 
 func setBreakpoint(t *Term, ctx callContext, tracepoint bool, argstr string) ([]*api.Breakpoint, error) {
 	var (
-		cond string
 		spec string
 
 		requestedBp = &api.Breakpoint{}
@@ -1839,7 +1832,7 @@ func setBreakpoint(t *Term, ctx callContext, tracepoint bool, argstr string) ([]
 		r := regexp.MustCompile(`^if | if `)
 		if match := r.FindStringIndex(argstr); match != nil {
 			requestedBp.Name = ""
-			cond = argstr[match[1]:]
+			requestedBp.Cond = argstr[match[1]:]
 			argstr = argstr[:match[0]]
 			args = config.Split2PartsBySpace(argstr)
 			if err := parseSpec(args); err != nil {
@@ -1859,13 +1852,22 @@ func setBreakpoint(t *Term, ctx callContext, tracepoint bool, argstr string) ([]
 			substSpec = substSpec2
 		}
 	}
-	if findLocErr != nil && shouldAskToSuspendBreakpoint(t) {
+
+	fns, _ := t.client.ListFunctions(`^plugin\.Open$`, 0)
+	_, err := t.client.GetState()
+	shouldAskToSuspendBreakpointQuestion := ""
+	switch {
+	case len(fns) > 0:
+		shouldAskToSuspendBreakpointQuestion = "Set a suspended breakpoint (Delve will try to set this breakpoint when a plugin is loaded) [Y/n]?"
+	case isErrProcessExited(err):
+		shouldAskToSuspendBreakpointQuestion = "Set a suspended breakpoint (Delve will try to set this breakpoint when process restarts) [Y/n]?"
+	case t.client.FollowExecEnabled():
+		shouldAskToSuspendBreakpointQuestion = "Set a suspended breakpoint (Delve will try to set this breakpoint when child processes are added) [Y/n]?"
+	}
+
+	if findLocErr != nil && shouldAskToSuspendBreakpointQuestion != "" {
 		fmt.Fprintf(os.Stderr, "Command failed: %s\n", findLocErr.Error())
-		question := "Set a suspended breakpoint (Delve will try to set this breakpoint when a plugin is loaded) [Y/n]?"
-		if isErrProcessExited(findLocErr) {
-			question = "Set a suspended breakpoint (Delve will try to set this breakpoint when the process is restarted) [Y/n]?"
-		}
-		answer, err := yesno(t.line, question, "yes")
+		answer, err := yesno(t.line, shouldAskToSuspendBreakpointQuestion, "yes")
 		if err != nil {
 			return nil, err
 		}
@@ -1897,7 +1899,6 @@ func setBreakpoint(t *Term, ctx callContext, tracepoint bool, argstr string) ([]
 			requestedBp.LoadArgs = &ShortLoadConfig
 		}
 
-		requestedBp.Cond = cond
 		bp, err := t.client.CreateBreakpointWithExpr(requestedBp, spec, t.substitutePathRules(), false)
 		if err != nil {
 			return nil, err
@@ -1918,12 +1919,12 @@ func setBreakpoint(t *Term, ctx callContext, tracepoint bool, argstr string) ([]
 	case *locspec.RegexLocationSpec:
 		shouldSetReturnBreakpoints = true
 	}
-	if tracepoint && shouldSetReturnBreakpoints && locs[0].Function != nil {
+	if tracepoint && shouldSetReturnBreakpoints {
 		for i := range locs {
 			if locs[i].Function == nil {
 				continue
 			}
-			addrs, err := t.client.(*rpc2.RPCClient).FunctionReturnLocations(locs[0].Function.Name())
+			addrs, err := t.client.(*rpc2.RPCClient).FunctionReturnLocations(locs[i].Function.Name())
 			if err != nil {
 				return nil, err
 			}
@@ -2167,10 +2168,7 @@ loop:
 	remsz := int(count * size)
 
 	for remsz > 0 {
-		reqsz := rpc2.ExamineMemoryLengthLimit
-		if reqsz > remsz {
-			reqsz = remsz
-		}
+		reqsz := min(rpc2.ExamineMemoryLengthLimit, remsz)
 		memArea, isLittleEndian, err := t.client.ExamineMemory(start, reqsz)
 		if err != nil {
 			return err
@@ -2691,6 +2689,21 @@ func disassCommand(t *Term, ctx callContext, args string) error {
 }
 
 func libraries(t *Term, ctx callContext, args string) error {
+	argv := config.Split2PartsBySpace(args)
+	if len(argv) == 2 {
+		switch argv[0] {
+		case "-d":
+			n, err := strconv.Atoi(argv[1])
+			if err != nil {
+				return err
+			}
+			t.client.DownloadLibraryDebugInfo(n)
+		default:
+			return errors.New("wrong arguments")
+		}
+		return nil
+	}
+
 	libs, err := t.client.ListDynamicLibraries()
 	if err != nil {
 		return err
@@ -3053,14 +3066,8 @@ func printdisass(t *Term, pc uint64) error {
 	showHeader := true
 	for i := range disasm {
 		if disasm[i].AtPC {
-			s := i - lineCount
-			if s < 0 {
-				s = 0
-			}
-			e := i + lineCount + 1
-			if e > len(disasm) {
-				e = len(disasm)
-			}
+			s := max(i-lineCount, 0)
+			e := min(i+lineCount+1, len(disasm))
 			showHeader = s == 0
 			disasm = disasm[s:e]
 			break
@@ -3566,10 +3573,4 @@ func (t *Term) formatBreakpointLocation(bp *api.Breakpoint) string {
 		fmt.Fprintf(&out, "%s:%d", p, bp.Line)
 	}
 	return out.String()
-}
-
-func shouldAskToSuspendBreakpoint(t *Term) bool {
-	fns, _ := t.client.ListFunctions(`^plugin\.Open$`, 0)
-	_, err := t.client.GetState()
-	return len(fns) > 0 || isErrProcessExited(err) || t.client.FollowExecEnabled()
 }

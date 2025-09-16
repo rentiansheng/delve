@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/go-delve/delve/pkg/astutil"
 	"github.com/go-delve/delve/pkg/dwarf/godwarf"
 	"github.com/go-delve/delve/pkg/dwarf/op"
 	"github.com/go-delve/delve/pkg/dwarf/reader"
@@ -339,14 +340,17 @@ func (scope *EvalScope) evalCallInjectionStart(op *evalop.CallInjectionStart, st
 			stack.err = err
 			return
 		}
-	case "arm64", "ppc64le":
+	case "arm64", "ppc64le", "loong64":
 		// debugCallV2 on arm64 needs a special call sequence, callOP can not be used
 		sp := regs.SP()
 		var spOffset uint64
-		if bi.Arch.Name == "arm64" {
+		switch bi.Arch.Name {
+		case "arm64":
 			spOffset = 2 * uint64(bi.Arch.PtrSize())
-		} else {
+		case "ppc64le":
 			spOffset = 4 * uint64(bi.Arch.PtrSize())
+		case "loong64":
+			spOffset = 1 * uint64(bi.Arch.PtrSize())
 		}
 		sp -= spOffset
 		if err := setSP(thread, sp); err != nil {
@@ -389,7 +393,7 @@ func (scope *EvalScope) evalCallInjectionStart(op *evalop.CallInjectionStart, st
 	p.fncallForG[scope.g.ID].startThreadID = thread.ThreadID()
 
 	stack.fncallPush(&fncall)
-	stack.push(newConstant(constant.MakeBool(!fncall.hasDebugPinner && (fncall.fn == nil || fncall.receiver != nil || fncall.closureAddr != 0)), scope.Mem))
+	stack.push(newConstant(constant.MakeBool(!fncall.hasDebugPinner && (fncall.fn == nil || fncall.receiver != nil || fncall.closureAddr != 0)), scope.BinInfo, scope.Mem))
 	stack.callInjectionContinue = true
 }
 
@@ -449,7 +453,7 @@ func (err fncallPanicErr) Error() string {
 	return "panic calling a function"
 }
 
-func fncallLog(fmtstr string, args ...interface{}) {
+func fncallLog(fmtstr string, args ...any) {
 	logflags.FnCallLogger().Infof(fmtstr, args...)
 }
 
@@ -487,7 +491,7 @@ func callOP(bi *BinaryInfo, thread Thread, regs Registers, callAddr uint64) erro
 			return err
 		}
 		return setPC(thread, callAddr)
-	case "arm64", "ppc64le":
+	case "arm64", "ppc64le", "loong64":
 		if err := setLR(thread, regs.PC()); err != nil {
 			return err
 		}
@@ -505,7 +509,7 @@ func funcCallEvalFuncExpr(scope *EvalScope, stack *evalStack, fncall *functionCa
 
 	fnvar := stack.peek()
 	if fnvar.Kind != reflect.Func {
-		return fmt.Errorf("expression %q is not a function", exprToString(fncall.expr.Fun))
+		return fmt.Errorf("expression %q is not a function", astutil.ExprToString(fncall.expr.Fun))
 	}
 	fnvar.loadValue(LoadConfig{false, 0, 0, 0, 0, 0})
 	if fnvar.Unreadable != nil {
@@ -516,7 +520,7 @@ func funcCallEvalFuncExpr(scope *EvalScope, stack *evalStack, fncall *functionCa
 	}
 	fncall.fn = bi.PCToFunc(fnvar.Base)
 	if fncall.fn == nil {
-		return fmt.Errorf("could not find DIE for function %q", exprToString(fncall.expr.Fun))
+		return fmt.Errorf("could not find DIE for function %q", astutil.ExprToString(fncall.expr.Fun))
 	}
 	if !fncall.fn.cu.isgo {
 		return errNotAGoFunction
@@ -539,7 +543,11 @@ func funcCallEvalFuncExpr(scope *EvalScope, stack *evalStack, fncall *functionCa
 	if len(fnvar.Children) > 0 && argnum == (len(fncall.formalArgs)-1) {
 		argnum++
 		fncall.receiver = &fnvar.Children[0]
-		fncall.receiver.Name = exprToString(fncall.expr.Fun)
+		_, isptr := fncall.receiver.DwarfType.(*godwarf.PtrType)
+		if fncall.receiver.Addr == 0 && !isptr {
+			return errors.New("nil pointer dereference")
+		}
+		fncall.receiver.Name = astutil.ExprToString(fncall.expr.Fun)
 	}
 
 	if argnum > len(fncall.formalArgs) {
@@ -631,7 +639,7 @@ func funcCallArgs(fn *Function, bi *BinaryInfo, includeRet bool) (argFrameSize i
 		if err != nil {
 			return 0, nil, err
 		}
-		typ = resolveTypedef(typ)
+		typ = godwarf.ResolveTypedef(typ)
 
 		var formalArg *funcCallArg
 		if bi.regabi {
@@ -742,12 +750,12 @@ func allPointers(v *Variable, name string, f func(addr uint64, name string) erro
 		return f(v.Base, name)
 	case reflect.Map:
 		sv := v.clone()
-		sv.RealType = resolveTypedef(&(v.RealType.(*godwarf.MapType).TypedefType))
+		sv.RealType = godwarf.ResolveTypedef(&(v.RealType.(*godwarf.MapType).TypedefType))
 		sv = sv.maybeDereference()
 		return f(sv.Addr, name)
 	case reflect.Interface:
 		sv := v.clone()
-		sv.RealType = resolveTypedef(&(v.RealType.(*godwarf.InterfaceType).TypedefType))
+		sv.RealType = godwarf.ResolveTypedef(&(v.RealType.(*godwarf.InterfaceType).TypedefType))
 		sv = sv.maybeDereference()
 		sv.Kind = reflect.Struct
 		return allPointers(sv, name, f)
@@ -808,13 +816,13 @@ func funcCallStep(callScope *EvalScope, stack *evalStack, thread Thread) bool {
 	regs, err := thread.Registers()
 	if err != nil {
 		fncall.err = err
-		return true
+		return false
 	}
 
 	regval := bi.Arch.RegistersToDwarfRegisters(0, regs).Uint64Val(fncall.protocolReg)
 
 	if logflags.FnCall() {
-		loc, _ := thread.Location()
+		loc, _ := ThreadLocation(thread)
 		var pc uint64
 		var fnname string
 		if loc != nil {
@@ -830,7 +838,7 @@ func funcCallStep(callScope *EvalScope, stack *evalStack, thread Thread) bool {
 	case debugCallRegPrecheckFailed: // 8
 		stack.callInjectionContinue = true
 		archoff := uint64(0)
-		if bi.Arch.Name == "arm64" {
+		if bi.Arch.Name == "arm64" || bi.Arch.Name == "loong64" {
 			archoff = 8
 		} else if bi.Arch.Name == "ppc64le" {
 			archoff = 40
@@ -892,7 +900,7 @@ func funcCallStep(callScope *EvalScope, stack *evalStack, thread Thread) bool {
 		// pretend we are still inside the function we called
 		fakeFunctionEntryScope(retScope, fncall.fn, int64(regs.SP()), regs.SP()-uint64(bi.Arch.PtrSize()))
 		var flags localsFlags
-		flags |= localsNoDeclLineCheck // if the function we are calling is an autogenerated stub then declaration lines have no meaning
+		flags |= localsNoDeclLineCheck | localsFakeFunctionEntryScope // if the function we are calling is an autogenerated stub then declaration lines have no meaning
 		if !bi.regabi {
 			flags |= localsTrustArgOrder
 		}
@@ -936,7 +944,7 @@ func funcCallStep(callScope *EvalScope, stack *evalStack, thread Thread) bool {
 		// read panic value from stack
 		stack.callInjectionContinue = true
 		archoff := uint64(0)
-		if bi.Arch.Name == "arm64" {
+		if bi.Arch.Name == "arm64" || bi.Arch.Name == "loong64" {
 			archoff = 8
 		} else if bi.Arch.Name == "ppc64le" {
 			archoff = 32
@@ -965,7 +973,7 @@ func callInjectionComplete2(callScope *EvalScope, bi *BinaryInfo, fncall *functi
 	if threadg, _ := GetG(thread); threadg != nil {
 		callScope.callCtx.stacks = append(callScope.callCtx.stacks, threadg.stack)
 	}
-	if bi.Arch.Name == "arm64" || bi.Arch.Name == "ppc64le" {
+	if bi.Arch.Name == "arm64" || bi.Arch.Name == "ppc64le" || bi.Arch.Name == "loong64" {
 		oldlr, err := readUintRaw(thread.ProcessMemory(), regs.SP(), int64(bi.Arch.PtrSize()))
 		if err != nil {
 			fncall.err = fmt.Errorf("could not restore LR: %v", err)
@@ -1002,7 +1010,7 @@ func (scope *EvalScope) evalCallInjectionSetTarget(op *evalop.CallInjectionSetTa
 
 	undo := new(undoInjection)
 	undo.oldpc = regs.PC()
-	if scope.BinInfo.Arch.Name == "arm64" || scope.BinInfo.Arch.Name == "ppc64le" {
+	if scope.BinInfo.Arch.Name == "arm64" || scope.BinInfo.Arch.Name == "ppc64le" || scope.BinInfo.Arch.Name == "loong64" {
 		undo.oldlr = regs.LR()
 	}
 	callOP(scope.BinInfo, thread, regs, fncall.fn.Entry)
@@ -1061,10 +1069,18 @@ func fakeFunctionEntryScope(scope *EvalScope, fn *Function, cfa int64, sp uint64
 }
 
 func (scope *EvalScope) callInjectionStartSpecial(stack *evalStack, op *evalop.CallInjectionStartSpecial, curthread Thread) bool {
+	if op.ComplainAboutStringAlloc && scope.callCtx == nil {
+		stack.err = errFuncCallNotAllowedStrAlloc
+		return false
+	}
 	fnv, err := scope.findGlobalInternal(op.FnName)
 	if fnv == nil {
 		if err == nil {
-			err = fmt.Errorf("function %s not found", op.FnName)
+			if op.ComplainAboutStringAlloc {
+				err = errFuncCallNotAllowedStrAlloc
+			} else {
+				err = fmt.Errorf("function %s not found", op.FnName)
+			}
 		}
 		stack.err = err
 		return false
@@ -1142,7 +1158,7 @@ func callInjectionProtocol(t *Target, trapthread Thread, threads []Thread) (done
 		t.currentThread = currentThread
 	}()
 	for _, thread := range threads {
-		loc, err := thread.Location()
+		loc, err := ThreadLocation(thread)
 		if err != nil {
 			continue
 		}
@@ -1247,6 +1263,11 @@ func debugCallProtocolReg(archName string, version int) (uint64, bool) {
 	case "arm64", "ppc64le":
 		if version == 2 {
 			return regnum.ARM64_X0 + 20, true
+		}
+		return 0, false
+	case "loong64":
+		if version == 2 {
+			return regnum.LOONG64_R0 + 19, true
 		}
 		return 0, false
 	default:

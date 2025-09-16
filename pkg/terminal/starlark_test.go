@@ -139,6 +139,7 @@ func testStarlarkAmendBreakpoint(t *testing.T, term *FakeTerminal) {
 	if !strings.Contains(out, "Stacktrace:2") || !strings.Contains(out, `HitCond:"== 2"`) {
 		t.Fatalf("wrong output")
 	}
+	term.MustExec("clear afuncbreak")
 }
 
 func TestStarlarkVariable(t *testing.T) {
@@ -181,6 +182,12 @@ func TestStarlarkVariable(t *testing.T) {
 			{`v = eval(None, "s2").Variable; print(v.Value[1].A)`, "3"},
 			{`v = eval(None, "s2").Variable; print(v.Value[1].A + 10)`, "13"},
 			{`v = eval(None, "s2").Variable; print(v.Value[1]["B"])`, "4"},
+
+			// Using target object
+			{`print(tgt.i1)`, "1"},
+			{`print(tgt.m1["Malone"])`, "main.astruct {A: 2, B: 3}"},
+			{`print(tgt.c1.pb)`, "*main.bstruct {a: main.astruct {A: 1, B: 2}}"},
+			{`print(tgt.c1.pb.a.B)`, "2"},
 		} {
 			out := strings.TrimSpace(term.MustExecStarlark(tc.expr))
 			if out != tc.tgt {
@@ -254,5 +261,48 @@ v.Children[0].Children[0].Value.XXX
 				}
 			})
 		}
+	})
+}
+
+func TestStarlarkChainBreakpointsExample(t *testing.T) {
+	withTestTerminal("bphitcountchain", t, func(term *FakeTerminal) {
+		term.MustExec("source " + findStarFile("chain_breakpoints"))
+		term.MustExec("break main.breakfunc1")
+		term.MustExec("break main.breakfunc2")
+		term.MustExec("break main.breakfunc3")
+		term.MustExec("chain 1 2 3")
+		out := term.MustExec("breakpoints")
+		t.Log(out)
+
+		numphys := func(id int) int {
+			bp, err := term.client.GetBreakpoint(id)
+			if err != nil {
+				t.Fatalf("Error getting breakpoint %d: %v", id, err)
+			}
+			return len(bp.Addrs)
+		}
+
+		assertPhysCount := func(lbp1cnt, lbp2cnt, lbp3cnt int) {
+			t.Helper()
+			t.Logf("lbp1: %d lbp2: %d lbp3: %d", numphys(1), numphys(2), numphys(3))
+			if numphys(1) != lbp1cnt || numphys(2) != lbp2cnt || numphys(3) != lbp3cnt {
+				t.Fatal("Wrong number of physical breakpoints")
+			}
+		}
+
+		assertPhysCount(1, 0, 0)
+
+		term.MustExec("continue")
+		listIsAt(t, term, "frame 1 list", 21, -1, -1)
+
+		term.MustExec("continue")
+		listIsAt(t, term, "frame 1 list", 25, -1, -1)
+
+		assertPhysCount(0, 1, 0)
+
+		term.MustExec("continue")
+		listIsAt(t, term, "frame 1 list", 28, -1, -1)
+
+		assertPhysCount(0, 0, 1)
 	})
 }

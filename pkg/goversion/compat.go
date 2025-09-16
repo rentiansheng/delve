@@ -1,17 +1,20 @@
 package goversion
 
 import (
+	"errors"
 	"fmt"
 	"runtime"
 
 	"github.com/go-delve/delve/pkg/logflags"
 )
 
+//lint:file-ignore ST1005 errors here can be capitalized
+
 var (
 	MinSupportedVersionOfGoMajor = 1
-	MinSupportedVersionOfGoMinor = 21
+	MinSupportedVersionOfGoMinor = 23
 	MaxSupportedVersionOfGoMajor = 1
-	MaxSupportedVersionOfGoMinor = 24
+	MaxSupportedVersionOfGoMinor = 25
 	goTooOldErr                  = fmt.Sprintf("Go version %%s is too old for this version of Delve (minimum supported version %d.%d, suppress this error with --check-go-version=false)", MinSupportedVersionOfGoMajor, MinSupportedVersionOfGoMinor)
 	goTooOldWarn                 = fmt.Sprintf("WARNING: undefined behavior - Go version %%s is too old for this version of Delve (minimum supported version %d.%d)", MinSupportedVersionOfGoMajor, MinSupportedVersionOfGoMinor)
 	dlvTooOldErr                 = fmt.Sprintf("Version of Delve is too old for Go version %%s (maximum supported version %d.%d, suppress this error with --check-go-version=false)", MaxSupportedVersionOfGoMajor, MaxSupportedVersionOfGoMinor)
@@ -20,7 +23,7 @@ var (
 
 // Compatible checks that the version specified in the producer string is compatible with
 // this version of delve.
-func Compatible(producer string, warnonly bool) error {
+func Compatible(dwarfVer uint8, producer string, warnonly bool) error {
 	ver := ParseProducer(producer)
 	if ver.IsOldDevel() {
 		return nil
@@ -45,6 +48,16 @@ func Compatible(producer string, warnonly bool) error {
 			return nil
 		}
 		return fmt.Errorf(dlvTooOldErr, ver.String())
+	}
+	if dwarfVer >= 5 {
+		if !VersionAfterOrEqual(runtime.Version(), 1, 25) {
+			const errstr = "To debug executables using DWARFv5 or later Delve must be built with Go version 1.25.0 or later"
+			if warnonly {
+				logflags.WriteError(errstr)
+				return nil
+			}
+			return errors.New(errstr)
+		}
 	}
 	return nil
 }

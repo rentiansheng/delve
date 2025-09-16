@@ -152,10 +152,7 @@ func newCompositeMemory(mem MemoryReadWriter, arch *Arch, regs op.DwarfRegisters
 		case op.ImmPiece:
 			buf := piece.Bytes
 			if buf == nil {
-				sz := 8
-				if piece.Size > sz {
-					sz = piece.Size
-				}
+				sz := max(piece.Size, 8)
 				if piece.Size == 0 && i == len(pieces)-1 {
 					piece.Size = arch.PtrSize() // DWARF doesn't say what this should be
 				}
@@ -190,7 +187,11 @@ func (mem *compositeMemory) WriteMemory(addr uint64, data []byte) (int, error) {
 		return 0, errors.New("write out of bounds")
 	}
 	if mem.regs.ChangeFunc == nil {
-		return 0, errors.New("can not write registers")
+		for _, piece := range mem.pieces {
+			if piece.Kind == op.RegPiece {
+				return 0, errors.New("can not write registers")
+			}
+		}
 	}
 
 	copy(mem.data[addr:], data)
@@ -216,7 +217,6 @@ func (mem *compositeMemory) WriteMemory(addr uint64, data []byte) (int, error) {
 					return donesz + n, err
 				}
 			case op.ImmPiece:
-				//TODO(aarzilli): maybe return an error if the user tried to change the value?
 				// nothing to do
 			default:
 				panic("unsupported piece kind")

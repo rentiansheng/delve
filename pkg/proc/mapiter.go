@@ -18,7 +18,7 @@ type mapIterator interface {
 func (v *Variable) mapIterator(maxNumBuckets uint64) mapIterator {
 	mt := v.RealType.(*godwarf.MapType)
 	sv := v.clone()
-	sv.RealType = resolveTypedef(&(sv.RealType.(*godwarf.MapType).TypedefType))
+	sv.RealType = godwarf.ResolveTypedef(&(sv.RealType.(*godwarf.MapType).TypedefType))
 	sv = sv.maybeDereference()
 	v.Base = sv.Addr
 
@@ -212,7 +212,7 @@ func (it *mapIteratorClassic) nextBucket() bool {
 	}
 
 	// sanity checks
-	if it.tophashes == nil || it.keys == nil || it.values == nil {
+	if it.tophashes == nil || it.keys == nil || it.values == nil || it.overflow == nil {
 		it.v.Unreadable = errors.New("malformed map type")
 		return false
 	}
@@ -349,6 +349,7 @@ var errSwissTableCouldNotLoad = errors.New("could not load one of the tables")
 var errSwissMapBadType = errors.New("swiss table type does not have some required fields")
 var errSwissMapBadTableField = errors.New("swiss table bad table field")
 var errSwissMapBadGroupTypeErr = errors.New("bad swiss map type, group type lacks some required fields")
+var errSwissTableNilGroups = errors.New("bad swiss map, groups pointer is nil")
 
 // loadTypes determines the correct type for it.dirPtr:  the linker records
 // this type as **table but in reality it is either *[dirLen]*table for
@@ -383,7 +384,7 @@ func (it *mapIteratorSwiss) loadTypes() {
 						it.groupsFieldData = field
 						typ, ok := field.Type.(*godwarf.PtrType)
 						if ok {
-							it.groupType, _ = resolveTypedef(typ.Type).(*godwarf.StructType)
+							it.groupType, _ = godwarf.ResolveTypedef(typ.Type).(*godwarf.StructType)
 						}
 					case "lengthMask":
 						it.groupsFieldLengthMask = field
@@ -409,7 +410,7 @@ func (it *mapIteratorSwiss) loadTypes() {
 		return
 	}
 
-	slotsType, ok := resolveTypedef(it.groupFieldSlots.Type).(*godwarf.ArrayType)
+	slotsType, ok := godwarf.ResolveTypedef(it.groupFieldSlots.Type).(*godwarf.ArrayType)
 	if !ok {
 		it.v.Unreadable = errSwissMapBadGroupTypeErr
 		return
@@ -565,6 +566,11 @@ func (it *mapIteratorSwiss) loadCurrentTable() {
 	r.groups.DwarfType = pointerTo(fakeArrayType(groupsLengthMask+1, it.groupType), it.v.bi.Arch)
 	r.groups.RealType = r.groups.DwarfType
 	r.groups = r.groups.maybeDereference()
+
+	if r.groups.Addr == 0 {
+		it.v.Unreadable = errSwissTableNilGroups
+		return
+	}
 
 	it.tab = r
 }

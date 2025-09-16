@@ -1,25 +1,31 @@
 package evalop
 
 import (
-	"bytes"
 	"errors"
 	"fmt"
 	"go/ast"
 	"go/constant"
 	"go/parser"
-	"go/printer"
 	"go/scanner"
 	"go/token"
 	"strconv"
 	"strings"
 
+	"github.com/go-delve/delve/pkg/astutil"
 	"github.com/go-delve/delve/pkg/dwarf/godwarf"
 	"github.com/go-delve/delve/pkg/dwarf/reader"
 )
 
 var (
-	ErrFuncCallNotAllowed   = errors.New("function calls not allowed without using 'call'")
-	DebugPinnerFunctionName = "runtime.debugPinnerV1"
+	ErrFuncCallNotAllowed = errors.New("function calls not allowed without using 'call'")
+	errFuncCallNotAllowedLitAlloc = errors.New("literal can not be allocated because function calls are not allowed without using 'call'")
+)
+
+const (
+	BreakpointHitCountVarNamePackage   = "delve"
+	BreakpointHitCountVarName          = "bphitcount"
+	BreakpointHitCountVarNameQualified = BreakpointHitCountVarNamePackage + "." + BreakpointHitCountVarName
+	DebugPinnerFunctionName            = "runtime.debugPinnerV1"
 )
 
 type compileCtx struct {
@@ -28,12 +34,14 @@ type compileCtx struct {
 	allowCalls bool
 	curCall    int
 	flags      Flags
-	firstCall  bool
+	pinnerUsed bool
+	hasCalls   bool
 }
 
 type evalLookup interface {
 	FindTypeExpr(ast.Expr) (godwarf.Type, error)
 	HasBuiltin(string) bool
+	PtrSize() int
 }
 
 // Flags describes flags used to control Compile and CompileAST
@@ -46,13 +54,13 @@ const (
 
 // CompileAST compiles the expression t into a list of instructions.
 func CompileAST(lookup evalLookup, t ast.Expr, flags Flags) ([]Op, error) {
-	ctx := &compileCtx{evalLookup: lookup, allowCalls: true, flags: flags, firstCall: true}
-	err := ctx.compileAST(t)
+	ctx := &compileCtx{evalLookup: lookup, allowCalls: true, flags: flags}
+	err := ctx.compileAST(t, true)
 	if err != nil {
 		return nil, err
 	}
 
-	ctx.compileDebugUnpin()
+	ctx.compileDebugPinnerSetupTeardown()
 
 	err = ctx.depthCheck(1)
 	if err != nil {
@@ -97,22 +105,25 @@ func CompileSet(lookup evalLookup, lhexpr, rhexpr string, flags Flags) ([]Op, er
 		return nil, err
 	}
 
-	ctx := &compileCtx{evalLookup: lookup, allowCalls: true, flags: flags, firstCall: true}
-	err = ctx.compileAST(rhe)
+	ctx := &compileCtx{evalLookup: lookup, allowCalls: true, flags: flags}
+	err = ctx.compileAST(rhe, false)
 	if err != nil {
 		return nil, err
 	}
 
-	if isStringLiteral(rhe) {
-		ctx.compileAllocLiteralString()
+	err = ctx.maybeMaterialize(rhe)
+	if err != nil {
+		return nil, err
 	}
 
-	err = ctx.compileAST(lhe)
+	err = ctx.compileAST(lhe, false)
 	if err != nil {
 		return nil, err
 	}
 
 	ctx.pushOp(&SetValue{lhe: lhe, Rhe: rhe})
+
+	ctx.compileDebugPinnerSetupTeardown()
 
 	err = ctx.depthCheck(0)
 	if err != nil {
@@ -133,23 +144,31 @@ func (ctx *compileCtx) compileAllocLiteralString() {
 		&PushLen{},
 		&PushNil{},
 		&PushConst{constant.MakeBool(false)},
-	}, true)
+	}, specialCallDoPinning|specialCallIsStringAlloc)
 
 	ctx.pushOp(&ConvertAllocToString{})
 	jmp.Target = len(ctx.ops)
 }
 
-func (ctx *compileCtx) compileSpecialCall(fnname string, argAst []ast.Expr, args []Op, doPinning bool) {
-	if doPinning {
-		ctx.compileGetDebugPinner()
-	}
+type specialCallFlags uint8
+
+const (
+	specialCallDoPinning specialCallFlags = 1 << iota
+	specialCallIsStringAlloc
+	specialCallComplainAboutStringAlloc
+)
+
+func (ctx *compileCtx) compileSpecialCall(fnname string, argAst []ast.Expr, args []Op, flags specialCallFlags) {
+	doPinning := flags&specialCallDoPinning != 0
 
 	id := ctx.curCall
 	ctx.curCall++
 	ctx.pushOp(&CallInjectionStartSpecial{
 		id:     id,
 		FnName: fnname,
-		ArgAst: argAst})
+		ArgAst: argAst,
+
+		ComplainAboutStringAlloc: flags&specialCallComplainAboutStringAlloc != 0})
 	ctx.pushOp(&CallInjectionSetTarget{id: id})
 
 	for i := range args {
@@ -161,6 +180,13 @@ func (ctx *compileCtx) compileSpecialCall(fnname string, argAst []ast.Expr, args
 
 	doPinning = doPinning && (ctx.flags&HasDebugPinner != 0)
 
+	if doPinning {
+		ctx.pinnerUsed = true
+		if flags&specialCallIsStringAlloc == 0 {
+			ctx.hasCalls = true
+		}
+	}
+
 	ctx.pushOp(&CallInjectionComplete{id: id, DoPinning: doPinning})
 
 	if doPinning {
@@ -168,25 +194,40 @@ func (ctx *compileCtx) compileSpecialCall(fnname string, argAst []ast.Expr, args
 	}
 }
 
-func (ctx *compileCtx) compileGetDebugPinner() {
-	if ctx.firstCall && ctx.flags&HasDebugPinner != 0 {
-		ctx.compileSpecialCall(DebugPinnerFunctionName, []ast.Expr{}, []Op{}, false)
-		ctx.pushOp(&SetDebugPinner{})
-		ctx.firstCall = false
+func (ctx *compileCtx) compileDebugPinnerSetupTeardown() {
+	if !ctx.pinnerUsed {
+		return
 	}
-}
 
-func (ctx *compileCtx) compileDebugUnpin() {
-	if !ctx.firstCall && ctx.flags&HasDebugPinner != 0 {
-		ctx.compileSpecialCall("runtime.(*Pinner).Unpin", []ast.Expr{
-			&ast.Ident{Name: "debugPinner"},
-		}, []Op{
-			&PushDebugPinner{},
-		}, false)
-		ctx.pushOp(&Pop{})
-		ctx.pushOp(&PushNil{})
-		ctx.pushOp(&SetDebugPinner{})
+	// Prepend debug pinner allocation
+	mainops := ctx.ops
+	ctx.ops = []Op{}
+	flags := specialCallFlags(0)
+	if !ctx.hasCalls {
+		flags = specialCallComplainAboutStringAlloc
 	}
+	ctx.compileSpecialCall(DebugPinnerFunctionName, []ast.Expr{}, []Op{}, flags)
+	ctx.pushOp(&SetDebugPinner{})
+
+	// Adjust jump destinations
+	for _, op := range mainops {
+		switch op := op.(type) {
+		case *Jump:
+			op.Target += len(ctx.ops)
+		}
+	}
+
+	ctx.ops = append(ctx.ops, mainops...)
+
+	// Append debug pinner deallocation
+	ctx.compileSpecialCall("runtime.(*Pinner).Unpin", []ast.Expr{
+		&ast.Ident{Name: "debugPinner"},
+	}, []Op{
+		&PushDebugPinner{},
+	}, 0)
+	ctx.pushOp(&Pop{})
+	ctx.pushOp(&PushNil{})
+	ctx.pushOp(&SetDebugPinner{})
 }
 
 func (ctx *compileCtx) pushOp(op Op) {
@@ -248,17 +289,17 @@ func (ctx *compileCtx) depthCheck(endDepth int) error {
 	return nil
 }
 
-func (ctx *compileCtx) compileAST(t ast.Expr) error {
+func (ctx *compileCtx) compileAST(t ast.Expr, toplevel bool) error {
 	switch node := t.(type) {
 	case *ast.CallExpr:
-		return ctx.compileTypeCastOrFuncCall(node)
+		return ctx.compileTypeCastOrFuncCall(node, toplevel)
 
 	case *ast.Ident:
 		return ctx.compileIdent(node)
 
 	case *ast.ParenExpr:
 		// otherwise just eval recursively
-		return ctx.compileAST(node.X)
+		return ctx.compileAST(node.X, false)
 
 	case *ast.SelectorExpr: // <expression>.<identifier>
 		switch x := node.X.(type) {
@@ -275,6 +316,9 @@ func (ctx *compileCtx) compileAST(t ast.Expr) error {
 
 			case x.Name == "runtime" && node.Sel.Name == "rangeParentOffset":
 				ctx.pushOp(&PushRangeParentOffset{})
+
+			case x.Name == BreakpointHitCountVarNamePackage && node.Sel.Name == BreakpointHitCountVarName:
+				ctx.pushOp(&PushBreakpointHitCount{})
 
 			default:
 				ctx.pushOp(&PushPackageVarOrSelect{Name: x.Name, Sel: node.Sel.Name})
@@ -362,16 +406,79 @@ func (ctx *compileCtx) compileAST(t ast.Expr) error {
 	case *ast.BasicLit:
 		ctx.pushOp(&PushConst{constant.MakeFromLiteral(node.Value, node.Kind, 0)})
 
+	case *ast.CompositeLit:
+		notimplerr := fmt.Errorf("expression %T not implemented", t)
+		if ctx.flags&HasDebugPinner == 0 {
+			return notimplerr
+		}
+		dtyp, err := ctx.FindTypeExpr(node.Type)
+		if err != nil {
+			return err
+		}
+		typ := godwarf.ResolveTypedef(dtyp)
+		switch typ := typ.(type) {
+		case *godwarf.StructType:
+			if !ctx.allowCalls {
+				return errFuncCallNotAllowedLitAlloc
+			}
+
+			ctx.pushOp(&PushNewFakeVariable{Type: dtyp})
+
+			for i, elt := range node.Elts {
+				ctx.pushOp(&Dup{})
+
+				var rhe ast.Expr
+				switch elt := elt.(type) {
+				case *ast.KeyValueExpr:
+					ctx.pushOp(&Select{Name: elt.Key.(*ast.Ident).Name})
+					rhe = elt.Value
+					err := ctx.compileAST(elt.Value, false)
+					if err != nil {
+						return err
+					}
+					err = ctx.maybeMaterialize(elt.Value)
+					if err != nil {
+						return err
+					}
+				default:
+					ctx.pushOp(&Select{Name: typ.Field[i].Name})
+					rhe = elt
+					err := ctx.compileAST(elt, false)
+					if err != nil {
+						return err
+					}
+					err = ctx.maybeMaterialize(elt)
+					if err != nil {
+						return err
+					}
+				}
+				ctx.pushOp(&Roll{1})
+				ctx.pushOp(&SetValue{Rhe: rhe})
+			}
+
+		case *godwarf.SliceType:
+			return notimplerr
+
+		case *godwarf.MapType:
+			return notimplerr
+
+		case *godwarf.ArrayType:
+			return notimplerr
+
+		default:
+			return notimplerr
+		}
+
 	default:
 		return fmt.Errorf("expression %T not implemented", t)
 	}
 	return nil
 }
 
-func (ctx *compileCtx) compileTypeCastOrFuncCall(node *ast.CallExpr) error {
+func (ctx *compileCtx) compileTypeCastOrFuncCall(node *ast.CallExpr, toplevel bool) error {
 	if len(node.Args) != 1 {
 		// Things that have more or less than one argument are always function calls.
-		return ctx.compileFunctionCall(node)
+		return ctx.compileFunctionCall(node, toplevel)
 	}
 
 	ambiguous := func() error {
@@ -379,9 +486,9 @@ func (ctx *compileCtx) compileTypeCastOrFuncCall(node *ast.CallExpr) error {
 		// evaluated then try to treat it as a function call, otherwise try the
 		// type cast.
 		ctx2 := &compileCtx{evalLookup: ctx.evalLookup}
-		err0 := ctx2.compileAST(node.Fun)
+		err0 := ctx2.compileAST(node.Fun, false)
 		if err0 == nil {
-			return ctx.compileFunctionCall(node)
+			return ctx.compileFunctionCall(node, toplevel)
 		}
 		return ctx.compileTypeCast(node, err0)
 	}
@@ -409,12 +516,12 @@ func (ctx *compileCtx) compileTypeCastOrFuncCall(node *ast.CallExpr) error {
 			}
 			return ambiguous()
 		}
-		return ctx.compileFunctionCall(node)
+		return ctx.compileFunctionCall(node, toplevel)
 	case *ast.Ident:
 		if typ, _ := ctx.FindTypeExpr(n); typ != nil {
 			return ctx.compileTypeCast(node, fmt.Errorf("could not find symbol value for %s", n.Name))
 		}
-		return ctx.compileFunctionCall(node)
+		return ctx.compileFunctionCall(node, toplevel)
 	case *ast.IndexExpr:
 		// Ambiguous, could be a parametric type
 		switch n.X.(type) {
@@ -424,20 +531,20 @@ func (ctx *compileCtx) compileTypeCastOrFuncCall(node *ast.CallExpr) error {
 			if err == nil || err != reader.ErrTypeNotFound {
 				return err
 			}
-			return ctx.compileFunctionCall(node)
+			return ctx.compileFunctionCall(node, toplevel)
 		default:
-			return ctx.compileFunctionCall(node)
+			return ctx.compileFunctionCall(node, toplevel)
 		}
 	case *ast.IndexListExpr:
 		return ctx.compileTypeCast(node, nil)
 	default:
 		// All other expressions must be function calls
-		return ctx.compileFunctionCall(node)
+		return ctx.compileFunctionCall(node, toplevel)
 	}
 }
 
 func (ctx *compileCtx) compileTypeCast(node *ast.CallExpr, ambiguousErr error) error {
-	err := ctx.compileAST(node.Args[0])
+	err := ctx.compileAST(node.Args[0], false)
 	if err != nil {
 		return err
 	}
@@ -447,7 +554,7 @@ func (ctx *compileCtx) compileTypeCast(node *ast.CallExpr, ambiguousErr error) e
 	// remove all enclosing parenthesis from the type name
 	fnnode = removeParen(fnnode)
 
-	targetTypeStr := exprToString(removeParen(node.Fun))
+	targetTypeStr := astutil.ExprToString(removeParen(node.Fun))
 	styp, err := ctx.FindTypeExpr(fnnode)
 	if err != nil {
 		switch targetTypeStr {
@@ -457,7 +564,7 @@ func (ctx *compileCtx) compileTypeCast(node *ast.CallExpr, ambiguousErr error) e
 			styp = godwarf.FakeSliceType(godwarf.FakeBasicType("int", 32))
 		default:
 			if ambiguousErr != nil && err == reader.ErrTypeNotFound {
-				return fmt.Errorf("could not evaluate function or type %s: %v", exprToString(node.Fun), ambiguousErr)
+				return fmt.Errorf("could not evaluate function or type %s: %v", astutil.ExprToString(node.Fun), ambiguousErr)
 			}
 			return err
 		}
@@ -469,7 +576,7 @@ func (ctx *compileCtx) compileTypeCast(node *ast.CallExpr, ambiguousErr error) e
 
 func (ctx *compileCtx) compileBuiltinCall(builtin string, args []ast.Expr) error {
 	for _, arg := range args {
-		err := ctx.compileAST(arg)
+		err := ctx.compileAST(arg, false)
 		if err != nil {
 			return err
 		}
@@ -484,7 +591,7 @@ func (ctx *compileCtx) compileIdent(node *ast.Ident) error {
 }
 
 func (ctx *compileCtx) compileUnary(expr ast.Expr, op Op) error {
-	err := ctx.compileAST(expr)
+	err := ctx.compileAST(expr, false)
 	if err != nil {
 		return err
 	}
@@ -493,7 +600,7 @@ func (ctx *compileCtx) compileUnary(expr ast.Expr, op Op) error {
 }
 
 func (ctx *compileCtx) compileTypeAssert(node *ast.TypeAssertExpr) error {
-	err := ctx.compileAST(node.X)
+	err := ctx.compileAST(node.X, false)
 	if err != nil {
 		return err
 	}
@@ -513,14 +620,14 @@ func (ctx *compileCtx) compileTypeAssert(node *ast.TypeAssertExpr) error {
 }
 
 func (ctx *compileCtx) compileBinary(a, b ast.Expr, sop *Jump, op Op) error {
-	err := ctx.compileAST(a)
+	err := ctx.compileAST(a, false)
 	if err != nil {
 		return err
 	}
 	if sop != nil {
 		ctx.pushOp(sop)
 	}
-	err = ctx.compileAST(b)
+	err = ctx.compileAST(b, false)
 	if err != nil {
 		return err
 	}
@@ -529,7 +636,7 @@ func (ctx *compileCtx) compileBinary(a, b ast.Expr, sop *Jump, op Op) error {
 }
 
 func (ctx *compileCtx) compileReslice(node *ast.SliceExpr) error {
-	err := ctx.compileAST(node.X)
+	err := ctx.compileAST(node.X, false)
 	if err != nil {
 		return err
 	}
@@ -538,7 +645,7 @@ func (ctx *compileCtx) compileReslice(node *ast.SliceExpr) error {
 	hasHigh := false
 	if node.High != nil {
 		hasHigh = true
-		err = ctx.compileAST(node.High)
+		err = ctx.compileAST(node.High, false)
 		if err != nil {
 			return err
 		}
@@ -549,7 +656,7 @@ func (ctx *compileCtx) compileReslice(node *ast.SliceExpr) error {
 	}
 
 	if node.Low != nil {
-		err = ctx.compileAST(node.Low)
+		err = ctx.compileAST(node.Low, false)
 		if err != nil {
 			return err
 		}
@@ -563,7 +670,7 @@ func (ctx *compileCtx) compileReslice(node *ast.SliceExpr) error {
 	return nil
 }
 
-func (ctx *compileCtx) compileFunctionCall(node *ast.CallExpr) error {
+func (ctx *compileCtx) compileFunctionCall(node *ast.CallExpr, toplevel bool) error {
 	if fnnode, ok := node.Fun.(*ast.Ident); ok {
 		if ctx.HasBuiltin(fnnode.Name) {
 			return ctx.compileBuiltinCall(fnnode.Name, node.Args)
@@ -577,7 +684,7 @@ func (ctx *compileCtx) compileFunctionCall(node *ast.CallExpr) error {
 	ctx.curCall++
 
 	if ctx.flags&HasDebugPinner != 0 {
-		return ctx.compileFunctionCallWithPinning(node, id)
+		return ctx.compileFunctionCallWithPinning(node, id, toplevel)
 	}
 
 	return ctx.compileFunctionCallNoPinning(node, id)
@@ -589,7 +696,7 @@ func (ctx *compileCtx) compileFunctionCallNoPinning(node *ast.CallExpr, id int) 
 	oldAllowCalls := ctx.allowCalls
 	oldOps := ctx.ops
 	ctx.allowCalls = false
-	err := ctx.compileAST(node.Fun)
+	err := ctx.compileAST(node.Fun, false)
 	ctx.allowCalls = oldAllowCalls
 	hasFunc := false
 	if err != nil {
@@ -609,7 +716,7 @@ func (ctx *compileCtx) compileFunctionCallNoPinning(node *ast.CallExpr, id int) 
 		ctx.pushOp(jmpif)
 	}
 	ctx.pushOp(&Pop{})
-	err = ctx.compileAST(node.Fun)
+	err = ctx.compileAST(node.Fun, false)
 	if err != nil {
 		return err
 	}
@@ -620,12 +727,13 @@ func (ctx *compileCtx) compileFunctionCallNoPinning(node *ast.CallExpr, id int) 
 	ctx.pushOp(&CallInjectionSetTarget{id: id})
 
 	for i, arg := range node.Args {
-		err := ctx.compileAST(arg)
+		err := ctx.compileAST(arg, false)
 		if err != nil {
-			return fmt.Errorf("error evaluating %q as argument %d in function %s: %v", exprToString(arg), i+1, exprToString(node.Fun), err)
+			return fmt.Errorf("error evaluating %q as argument %d in function %s: %v", astutil.ExprToString(arg), i+1, astutil.ExprToString(node.Fun), err)
 		}
-		if isStringLiteral(arg) {
-			ctx.compileAllocLiteralString()
+		err = ctx.maybeMaterialize(arg)
+		if err != nil {
+			return err
 		}
 		ctx.pushOp(&CallInjectionCopyArg{id: id, ArgNum: i, ArgExpr: arg})
 	}
@@ -637,21 +745,25 @@ func (ctx *compileCtx) compileFunctionCallNoPinning(node *ast.CallExpr, id int) 
 
 // compileFunctionCallWithPinning compiles a function call when runtime.debugPinner
 // is available in the target.
-func (ctx *compileCtx) compileFunctionCallWithPinning(node *ast.CallExpr, id int) error {
-	ctx.compileGetDebugPinner()
+func (ctx *compileCtx) compileFunctionCallWithPinning(node *ast.CallExpr, id int, toplevel bool) error {
+	if !toplevel {
+		ctx.pinnerUsed = true
+	}
+	ctx.hasCalls = true
 
-	err := ctx.compileAST(node.Fun)
+	err := ctx.compileAST(node.Fun, false)
 	if err != nil {
 		return err
 	}
 
 	for i, arg := range node.Args {
-		err := ctx.compileAST(arg)
-		if isStringLiteral(arg) {
-			ctx.compileAllocLiteralString()
-		}
+		err := ctx.compileAST(arg, false)
 		if err != nil {
-			return fmt.Errorf("error evaluating %q as argument %d in function %s: %v", exprToString(arg), i+1, exprToString(node.Fun), err)
+			return fmt.Errorf("error evaluating %q as argument %d in function %s: %v", astutil.ExprToString(arg), i+1, astutil.ExprToString(node.Fun), err)
+		}
+		err = ctx.maybeMaterialize(arg)
+		if err != nil {
+			return err
 		}
 	}
 
@@ -665,9 +777,11 @@ func (ctx *compileCtx) compileFunctionCallWithPinning(node *ast.CallExpr, id int
 		ctx.pushOp(&CallInjectionCopyArg{id: id, ArgNum: i, ArgExpr: arg})
 	}
 
-	ctx.pushOp(&CallInjectionComplete{id: id, DoPinning: true})
+	ctx.pushOp(&CallInjectionComplete{id: id, DoPinning: !toplevel})
 
-	ctx.compilePinningLoop(id)
+	if !toplevel {
+		ctx.compilePinningLoop(id)
+	}
 
 	return nil
 }
@@ -683,11 +797,74 @@ func (ctx *compileCtx) compilePinningLoop(id int) {
 	}, []Op{
 		&PushDebugPinner{},
 		nil,
-	}, false)
+	}, 0)
 	ctx.pushOp(&Pop{})
 	ctx.pushOp(&Jump{When: JumpAlways, Target: loopStart})
 	jmp.Target = len(ctx.ops)
 	ctx.pushOp(&CallInjectionComplete2{id: id})
+}
+
+// If expr will produce a string literal or a pointer to a literal allocate
+// it into the target program's address space.
+func (ctx *compileCtx) maybeMaterialize(expr ast.Expr) error {
+	if isStringLiteralThatNeedsAlloc(expr) {
+		ctx.compileAllocLiteralString()
+		return nil
+	}
+
+	expr = removeParen(expr)
+	addrof, isunary := expr.(*ast.UnaryExpr)
+	if !isunary || addrof.Op != token.AND {
+		return nil
+	}
+	lit, iscomplit := addrof.X.(*ast.CompositeLit)
+	if !iscomplit {
+		return nil
+	}
+
+	dtyp, err := ctx.FindTypeExpr(lit.Type)
+	if err != nil {
+		return err
+	}
+
+	switch godwarf.ResolveTypedef(dtyp).(type) {
+	case *godwarf.StructType, *godwarf.ArrayType:
+		if _, isaddrof := ctx.ops[len(ctx.ops)-1].(*AddrOf); isaddrof {
+			ctx.ops = ctx.ops[:len(ctx.ops)-1]
+		} else {
+			ctx.pushOp(&PointerDeref{&ast.StarExpr{X: &ast.Ident{Name: "unallocated-literal"}}})
+		}
+
+		ctx.compileSpecialCall("runtime.mallocgc", []ast.Expr{
+			&ast.BasicLit{Kind: token.INT, Value: "1"},
+			lit.Type,
+			&ast.Ident{Name: "true"},
+		}, []Op{
+			&PushConst{Value: constant.MakeInt64(1)},
+			&PushRuntimeType{dtyp},
+			&PushConst{Value: constant.MakeBool(true)},
+		}, specialCallDoPinning)
+		ctx.pushOp(&TypeCast{
+			DwarfType: godwarf.FakePointerType(dtyp, int64(ctx.PtrSize())),
+			Node: &ast.CallExpr{
+				Fun:  lit.Type,
+				Args: []ast.Expr{&ast.Ident{Name: "new allocation"}}}})
+
+		xderef := &ast.StarExpr{X: &ast.Ident{Name: "new-allocation"}}
+		xset := &ast.Ident{Name: "literal-allocation"}
+
+		ctx.pushOp(&Dup{})                // stack after: [ ptrToRealLiteral, ptrToRealLiteral, fakeLiteral ]
+		ctx.pushOp(&PointerDeref{xderef}) // stack after: [ realLiteral, ptrToRealLiteral, fakeLiteral ]
+		ctx.pushOp(&Roll{2})              // stack after: [ fakeLiteral, realLiteral, ptrToRealLiteral ]
+		ctx.pushOp(&Roll{1})              // stack after: [ realLiteral, fakeLiteral, ptrToRealLiteral ]
+		ctx.pushOp(&SetValue{Rhe: xset})  // stack after: [ ptrToRealLiteral ]
+		return nil
+
+	default:
+		// either *godwarf.MapType, *godwarf.SliceType or *godwarf.FuncType
+		return fmt.Errorf("allocating a literal of type %s not implemented", dtyp.String())
+	}
+
 }
 
 func Listing(depth []int, ops []Op) string {
@@ -701,16 +878,16 @@ func Listing(depth []int, ops []Op) string {
 	return buf.String()
 }
 
-func isStringLiteral(expr ast.Expr) bool {
+func isStringLiteralThatNeedsAlloc(expr ast.Expr) bool {
 	switch expr := expr.(type) {
 	case *ast.BasicLit:
-		return expr.Kind == token.STRING
+		return expr.Kind == token.STRING && expr.Value != `""`
 	case *ast.BinaryExpr:
 		if expr.Op == token.ADD {
-			return isStringLiteral(expr.X) && isStringLiteral(expr.Y)
+			return isStringLiteralThatNeedsAlloc(expr.X) && isStringLiteralThatNeedsAlloc(expr.Y)
 		}
 	case *ast.ParenExpr:
-		return isStringLiteral(expr.X)
+		return isStringLiteralThatNeedsAlloc(expr.X)
 	}
 	return false
 }
@@ -724,10 +901,4 @@ func removeParen(n ast.Expr) ast.Expr {
 		n = p.X
 	}
 	return n
-}
-
-func exprToString(t ast.Expr) string {
-	var buf bytes.Buffer
-	printer.Fprint(&buf, token.NewFileSet(), t)
-	return buf.String()
 }

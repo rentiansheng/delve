@@ -130,13 +130,13 @@ func assertNoError(err error, t testing.TB, s string) {
 
 func TestDwarfVersion(t *testing.T) {
 	// Tests that we correctly read the version of compilation units
-	fixture := protest.BuildFixture("math", 0)
+	fixture := protest.BuildFixture(t, "math", 0)
 	bi := NewBinaryInfo(runtime.GOOS, runtime.GOARCH)
 	// Use a fake entry point so LoadBinaryInfo does not error in case the binary is PIE.
 	const fakeEntryPoint = 1
 	assertNoError(bi.LoadBinaryInfo(fixture.Path, fakeEntryPoint, nil), t, "LoadBinaryInfo")
 	for _, cu := range bi.Images[0].compileUnits {
-		if cu.Version != 4 {
+		if cu.Version != 4 && cu.Version != 5 {
 			t.Errorf("compile unit %q at %#x has bad version %d", cu.name, cu.entry.Offset, cu.Version)
 		}
 	}
@@ -147,7 +147,7 @@ func TestRegabiFlagSentinel(t *testing.T) {
 	if !protest.RegabiSupported() {
 		t.Skip("irrelevant before Go 1.17 or on non-amd64 architectures")
 	}
-	fixture := protest.BuildFixture("math", 0)
+	fixture := protest.BuildFixture(t, "math", 0)
 	bi := NewBinaryInfo(runtime.GOOS, runtime.GOARCH)
 	// Use a fake entry point so LoadBinaryInfo does not error in case the binary is PIE.
 	const fakeEntryPoint = 1

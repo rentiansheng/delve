@@ -54,8 +54,10 @@ export GOPATH
 export PATH=$PATH:$GOROOT/bin:$GOPATH/bin
 go version
 if [ "$arch" != "ppc64le" ]; then
-	go install honnef.co/go/tools/cmd/staticcheck@2024.1.1 || true
+	go install honnef.co/go/tools/cmd/staticcheck@2025.1.1 || true
 fi
+
+go install github.com/google/capslock/cmd/capslock@latest
 
 uname -a
 echo "$PATH"

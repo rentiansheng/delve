@@ -114,7 +114,7 @@ func TestVariableEvaluation(t *testing.T) {
 	testcases := []struct {
 		name        string
 		st          reflect.Kind
-		value       interface{}
+		value       any
 		length, cap int64
 		childrenlen int
 	}{
@@ -669,6 +669,9 @@ func getEvalExpressionTestCases() []varTest {
 		{"mnil[\"Malone\"]", false, "", "", "", errors.New("key not found")},
 		{"m1[80:]", false, "", "", "", errors.New("map index out of bounds")},
 		{"mlarge", false, "map[main.largestruct]main.largestruct [{name: \"one\", v: [256]uint8 [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,...+192 more]}: {name: \"oneval\", v: [256]uint8 [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,...+192 more]}, ]", "map[main.largestruct]main.largestruct [...]", "map[main.largestruct]main.largestruct", nil},
+		{"m3[main.astruct{1,1}]", false, "42", "42", "int", nil},
+		{"m4[main.astruct{2,2}]", false, "main.astruct {A: 22, B: 22}", "main.astruct {A: 22, B: 22}", "main.astruct", nil},
+		{"m3[main.astruct{3,3}]", false, "", "", "", errors.New("key not found")},
 
 		// interfaces
 		{"err1", true, "error(*main.astruct) *{A: 1, B: 2}", "error(*main.astruct) 0x…", "error", nil},
@@ -812,7 +815,7 @@ func getEvalExpressionTestCases() []varTest {
 		{"i2 << f1", false, "", "", "", errors.New("shift count type float64, must be unsigned integer")},
 		{"i2 << -1", false, "", "", "", errors.New("shift count must not be negative")},
 		{"*(i2 + i3)", false, "", "", "", errors.New("expression \"(i2 + i3)\" (int) can not be dereferenced")},
-		{"i2.member", false, "", "", "", errors.New("i2 (type int) is not a struct")},
+		{"i2.member", false, "", "", "", errors.New("i2 (type int) has no member member")},
 		{"fmt.Println(\"hello\")", false, "", "", "", errors.New("function calls not allowed without using 'call'")},
 		{"*nil", false, "", "", "", errors.New("nil can not be dereferenced")},
 		{"!nil", false, "", "", "", errors.New("operator ! can not be applied to \"nil\"")},
@@ -833,6 +836,7 @@ func getEvalExpressionTestCases() []varTest {
 		{"int8(i6)", false, "12", "12", "int8", nil},
 		{"string(byteslice[0])", false, `"t"`, `"t"`, "string", nil},
 		{"string(runeslice[0])", false, `"t"`, `"t"`, "string", nil},
+		{"[]uint8(messageVar)", false, `[]uint8 len: 5, cap: 5, [1,2,3,4,5]`, `[]uint8 len: 5, cap: 5, [...]`, "[]uint8", nil},
 
 		// misc
 		{"i1", true, "1", "1", "int", nil},
@@ -982,6 +986,12 @@ func TestEvalExpression(t *testing.T) {
 					// this type of eval is unsupported with the current version of Go.
 					return
 				}
+				if err != nil && err.Error() == "expression *ast.CompositeLit not implemented" {
+					if !goversion.VersionAfterOrEqual(runtime.Version(), 1, 23) || runtime.GOARCH == "386" {
+						// composite literals not supported before 1.22
+						return
+					}
+				}
 				if tc.err == nil {
 					assertNoError(err, t, fmt.Sprintf("EvalExpression(%s) returned an error", tc.name))
 					assertVariable(t, variable, tc)
@@ -994,14 +1004,7 @@ func TestEvalExpression(t *testing.T) {
 					}
 					switch e := tc.err.(type) {
 					case *altError:
-						ok := false
-						for _, tgtErr := range e.errs {
-							if tgtErr == err.Error() {
-								ok = true
-								break
-							}
-						}
-						if !ok {
+						if !slices.Contains(e.errs, err.Error()) {
 							t.Fatalf("Unexpected error. Expected %s got %s", tc.err.Error(), err.Error())
 						}
 					default:
@@ -1252,7 +1255,7 @@ func TestIssue1075(t *testing.T) {
 	withTestProcess("clientdo", t, func(p *proc.Target, grp *proc.TargetGroup, fixture protest.Fixture) {
 		setFunctionBreakpoint(p, t, "net/http.(*Client).Do")
 		assertNoError(grp.Continue(), t, "Continue()")
-		for i := 0; i < 10; i++ {
+		for i := range 10 {
 			scope, err := proc.GoroutineScope(p, p.CurrentThread())
 			assertNoError(err, t, fmt.Sprintf("GoroutineScope (%d)", i))
 			vars, err := scope.LocalVariables(pnormalLoadConfig)
@@ -1284,8 +1287,8 @@ func TestCallFunction(t *testing.T) {
 		{"call1(one+two, 4)", []string{":int:7"}, nil, 0},
 		{"callpanic()", []string{`~panic:interface {}:interface {}(string) "callpanic panicked"`}, nil, 0},
 		{`stringsJoin(nil, "")`, []string{`:string:""`}, nil, 0},
-		{`stringsJoin(stringslice, comma)`, []string{`:string:"one,two,three"`}, nil, 1},
-		{`stringsJoin(stringslice, "~~")`, []string{`:string:"one~~two~~three"`}, nil, 2},
+		{`stringsJoin(stringslice, comma)`, []string{`:string:"one,two,three"`}, nil, 0},
+		{`stringsJoin(stringslice, "~~")`, []string{`:string:"one~~two~~three"`}, nil, 1},
 		{`stringsJoin(s1, comma)`, nil, errors.New(`could not find symbol value for s1`), 1},
 		{`stringsJoin(intslice, comma)`, nil, errors.New("can not convert value of type []int to []string"), 1},
 		{`noreturncall(2)`, nil, nil, 0},
@@ -1299,15 +1302,15 @@ func TestCallFunction(t *testing.T) {
 		// Call types tests (methods, function pointers, etc.)
 		// The following set of calls was constructed using https://docs.google.com/document/d/1bMwCey-gmqZVTpRax-ESeVuZGmjwbocYs1iHplK-cjo/pub as a reference
 
-		{`a.VRcvr(1)`, []string{`:string:"1 + 3 = 4"`}, nil, 1}, // direct call of a method with value receiver / on a value
+		{`a.VRcvr(1)`, []string{`:string:"1 + 3 = 4"`}, nil, 0}, // direct call of a method with value receiver / on a value
 
-		{`a.PRcvr(2)`, []string{`:string:"2 - 3 = -1"`}, nil, 1},  // direct call of a method with pointer receiver / on a value
-		{`pa.VRcvr(3)`, []string{`:string:"3 + 6 = 9"`}, nil, 1},  // direct call of a method with value receiver / on a pointer
-		{`pa.PRcvr(4)`, []string{`:string:"4 - 6 = -2"`}, nil, 1}, // direct call of a method with pointer receiver / on a pointer
+		{`a.PRcvr(2)`, []string{`:string:"2 - 3 = -1"`}, nil, 0},  // direct call of a method with pointer receiver / on a value
+		{`pa.VRcvr(3)`, []string{`:string:"3 + 6 = 9"`}, nil, 0},  // direct call of a method with value receiver / on a pointer
+		{`pa.PRcvr(4)`, []string{`:string:"4 - 6 = -2"`}, nil, 0}, // direct call of a method with pointer receiver / on a pointer
 
-		{`vable_pa.VRcvr(6)`, []string{`:string:"6 + 6 = 12"`}, nil, 1}, // indirect call of method on interface / containing value with value method
-		{`pable_pa.PRcvr(7)`, []string{`:string:"7 - 6 = 1"`}, nil, 1},  // indirect call of method on interface / containing pointer with value method
-		{`vable_a.VRcvr(5)`, []string{`:string:"5 + 3 = 8"`}, nil, 1},   // indirect call of method on interface / containing pointer with pointer method
+		{`vable_pa.VRcvr(6)`, []string{`:string:"6 + 6 = 12"`}, nil, 0}, // indirect call of method on interface / containing value with value method
+		{`pable_pa.PRcvr(7)`, []string{`:string:"7 - 6 = 1"`}, nil, 0},  // indirect call of method on interface / containing pointer with value method
+		{`vable_a.VRcvr(5)`, []string{`:string:"5 + 3 = 8"`}, nil, 0},   // indirect call of method on interface / containing pointer with pointer method
 
 		{`pa.nonexistent()`, nil, errors.New("pa has no member nonexistent"), 0},
 		{`a.nonexistent()`, nil, errors.New("a has no member nonexistent"), 0},
@@ -1316,14 +1319,14 @@ func TestCallFunction(t *testing.T) {
 		{`pable_pa.nonexistent()`, nil, errors.New("pable_pa has no member nonexistent"), 0},
 
 		{`fn2glob(10, 20)`, []string{":int:30"}, nil, 0},               // indirect call of func value / set to top-level func
-		{`fn2clos(11)`, []string{`:string:"1 + 6 + 11 = 18"`}, nil, 1}, // indirect call of func value / set to func literal
-		{`fn2clos(12)`, []string{`:string:"2 + 6 + 12 = 20"`}, nil, 1},
-		{`fn2valmeth(13)`, []string{`:string:"13 + 6 = 19"`}, nil, 1}, // indirect call of func value / set to value method
-		{`fn2ptrmeth(14)`, []string{`:string:"14 - 6 = 8"`}, nil, 1},  // indirect call of func value / set to pointer method
+		{`fn2clos(11)`, []string{`:string:"1 + 6 + 11 = 18"`}, nil, 0}, // indirect call of func value / set to func literal
+		{`fn2clos(12)`, []string{`:string:"2 + 6 + 12 = 20"`}, nil, 0},
+		{`fn2valmeth(13)`, []string{`:string:"13 + 6 = 19"`}, nil, 0}, // indirect call of func value / set to value method
+		{`fn2ptrmeth(14)`, []string{`:string:"14 - 6 = 8"`}, nil, 0},  // indirect call of func value / set to pointer method
 
 		{"fn2nil()", nil, errors.New("nil pointer dereference"), 0},
 
-		{"ga.PRcvr(2)", []string{`:string:"2 - 0 = 2"`}, nil, 1},
+		{"ga.PRcvr(2)", []string{`:string:"2 - 0 = 2"`}, nil, 0},
 
 		{"x.CallMe()", nil, nil, 0},
 		{"x2.CallMe(5)", []string{":int:25"}, nil, 0},
@@ -1332,10 +1335,10 @@ func TestCallFunction(t *testing.T) {
 
 		// Nested function calls tests
 
-		{`onetwothree(intcallpanic(2))`, []string{`:[]int:[]int len: 3, cap: 3, [3,4,5]`}, nil, 1},
+		{`onetwothree(intcallpanic(2))`, []string{`:[]int:[]int len: 3, cap: 3, [3,4,5]`}, nil, 0},
 		{`onetwothree(intcallpanic(0))`, []string{`~panic:interface {}:interface {}(string) "panic requested"`}, nil, 0},
-		{`onetwothree(intcallpanic(2)+1)`, []string{`:[]int:[]int len: 3, cap: 3, [4,5,6]`}, nil, 1},
-		{`onetwothree(intcallpanic("not a number"))`, nil, errors.New("can not convert \"not a number\" constant to int"), 1},
+		{`onetwothree(intcallpanic(2)+1)`, []string{`:[]int:[]int len: 3, cap: 3, [4,5,6]`}, nil, 0},
+		{`onetwothree(intcallpanic("not a number"))`, nil, altErrors("can not convert \"not a number\" constant to int", "literal string can not be allocated because function calls are not allowed without using 'call'"), 1},
 
 		// Variable setting tests
 		{`pa2 = getAStructPtr(8); pa2`, []string{`pa2:*main.astruct:*main.astruct {X: 8}`}, nil, 1},
@@ -1351,18 +1354,21 @@ func TestCallFunction(t *testing.T) {
 		// Issue 3176
 		{`ref.String()[0]`, []string{`:byte:98`}, nil, 1},
 		{`ref.String()[20]`, nil, errors.New("index out of bounds"), 1},
+
+		// Issue 4136
+		{`nilptrtostruct.VRcvr(0)`, []string{}, errors.New("nil pointer dereference"), 0},
 	}
 
 	var testcases112 = []testCaseCallFunction{
 		// string allocation requires trusted argument order, which we don't have in Go 1.11
-		{`stringsJoin(stringslice, ",")`, []string{`:string:"one,two,three"`}, nil, 2},
+		{`stringsJoin(stringslice, ",")`, []string{`:string:"one,two,three"`}, nil, 1},
 		{`str = "a new string"; str`, []string{`str:string:"a new string"`}, nil, 1},
 
 		// support calling optimized functions
 		{`strings.Join(nil, "")`, []string{`:string:""`}, nil, 0},
-		{`strings.Join(stringslice, comma)`, []string{`:string:"one,two,three"`}, nil, 1},
+		{`strings.Join(stringslice, comma)`, []string{`:string:"one,two,three"`}, nil, 0},
 		{`strings.Join(intslice, comma)`, nil, errors.New("can not convert value of type []int to []string"), 1},
-		{`strings.Join(stringslice, ",")`, []string{`:string:"one,two,three"`}, nil, 2},
+		{`strings.Join(stringslice, ",")`, []string{`:string:"one,two,three"`}, nil, 1},
 		{`strings.LastIndexByte(stringslice[1], 'w')`, []string{":int:1"}, nil, 0},
 		{`strings.LastIndexByte(stringslice[1], 'o')`, []string{":int:2"}, nil, 0},
 		{`d.Base.Method()`, []string{`:int:4`}, nil, 0},
@@ -1374,15 +1380,15 @@ func TestCallFunction(t *testing.T) {
 
 		// Method calls on a value returned by a function
 
-		{`getAStruct(3).VRcvr(1)`, []string{`:string:"1 + 3 = 4"`}, nil, 1}, // direct call of a method with value receiver / on a value
+		{`getAStruct(3).VRcvr(1)`, []string{`:string:"1 + 3 = 4"`}, nil, 0}, // direct call of a method with value receiver / on a value
 
 		{`getAStruct(3).PRcvr(2)`, nil, errors.New("could not set call receiver: cannot use getAStruct(3).PRcvr as argument pa in function main.(*astruct).PRcvr: stack object passed to escaping pointer: pa"), 0}, // direct call of a method with pointer receiver / on a value
-		{`getAStructPtr(6).VRcvr(3)`, []string{`:string:"3 + 6 = 9"`}, nil, 2},  // direct call of a method with value receiver / on a pointer
-		{`getAStructPtr(6).PRcvr(4)`, []string{`:string:"4 - 6 = -2"`}, nil, 2}, // direct call of a method with pointer receiver / on a pointer
+		{`getAStructPtr(6).VRcvr(3)`, []string{`:string:"3 + 6 = 9"`}, nil, 1},  // direct call of a method with value receiver / on a pointer
+		{`getAStructPtr(6).PRcvr(4)`, []string{`:string:"4 - 6 = -2"`}, nil, 1}, // direct call of a method with pointer receiver / on a pointer
 
-		{`getVRcvrableFromAStruct(3).VRcvr(6)`, []string{`:string:"6 + 3 = 9"`}, nil, 3},     // indirect call of method on interface / containing value with value method
-		{`getPRcvrableFromAStructPtr(6).PRcvr(7)`, []string{`:string:"7 - 6 = 1"`}, nil, 3},  // indirect call of method on interface / containing pointer with value method
-		{`getVRcvrableFromAStructPtr(6).VRcvr(5)`, []string{`:string:"5 + 6 = 11"`}, nil, 3}, // indirect call of method on interface / containing pointer with pointer method
+		{`getVRcvrableFromAStruct(3).VRcvr(6)`, []string{`:string:"6 + 3 = 9"`}, nil, 2},     // indirect call of method on interface / containing value with value method
+		{`getPRcvrableFromAStructPtr(6).PRcvr(7)`, []string{`:string:"7 - 6 = 1"`}, nil, 2},  // indirect call of method on interface / containing pointer with value method
+		{`getVRcvrableFromAStructPtr(6).VRcvr(5)`, []string{`:string:"5 + 6 = 11"`}, nil, 2}, // indirect call of method on interface / containing pointer with pointer method
 	}
 
 	var testcasesBefore114After112 = []testCaseCallFunction{
@@ -1394,12 +1400,20 @@ func TestCallFunction(t *testing.T) {
 	}
 
 	var testcases117 = []testCaseCallFunction{
-		{`regabistacktest("one", "two", "three", "four", "five", 4)`, []string{`:string:"onetwo"`, `:string:"twothree"`, `:string:"threefour"`, `:string:"fourfive"`, `:string:"fiveone"`, ":uint8:8"}, nil, 10},
+		{`regabistacktest("one", "two", "three", "four", "five", 4)`, []string{`:string:"onetwo"`, `:string:"twothree"`, `:string:"threefour"`, `:string:"fourfive"`, `:string:"fiveone"`, ":uint8:8"}, nil, 5},
 		{`regabistacktest2(1, 2, 3, 4, 5, 6, 7, 8, 9, 10)`, []string{":int:3", ":int:5", ":int:7", ":int:9", ":int:11", ":int:13", ":int:15", ":int:17", ":int:19", ":int:11"}, nil, 0},
-		{`issue2698.String()`, []string{`:string:"1 2 3 4"`}, nil, 1},
-		{`issue3364.String()`, []string{`:string:"1 2"`}, nil, 1},
-		{`regabistacktest3(rast3, 5)`, []string{`:[10]string:[10]string ["onetwo","twothree","threefour","fourfive","fivesix","sixseven","sevenheight","heightnine","nineten","tenone"]`, ":uint8:15"}, nil, 10},
+		{`issue2698.String()`, []string{`:string:"1 2 3 4"`}, nil, 0},
+		{`issue3364.String()`, []string{`:string:"1 2"`}, nil, 0},
+		{`regabistacktest3(rast3, 5)`, []string{`:[10]string:[10]string ["onetwo","twothree","threefour","fourfive","fivesix","sixseven","sevenheight","heightnine","nineten","tenone"]`, ":uint8:15"}, nil, 0},
 		{`floatsum(1, 2)`, []string{":float64:3"}, nil, 0},
+	}
+
+	var testcases123 = []testCaseCallFunction{
+		{`mul2(main.a2struct{Y: 3})`, []string{":int:6"}, nil, 0},
+		{`mul2(main.a2struct{4})`, []string{":int:8"}, nil, 0},
+		{`mul2ptr(&main.a2struct{Y: 3})`, []string{":int:6"}, nil, 1},
+		{`mul2ptr(&main.a2struct{1})`, []string{":int:2"}, nil, 1},
+		{`m[main.intpair{3, 1}]`, []string{`:string:"three,one"`}, nil, 0},
 	}
 
 	withTestProcessArgs("fncall", t, ".", nil, protest.AllNonOptimized, func(p *proc.Target, grp *proc.TargetGroup, fixture protest.Fixture) {
@@ -1436,6 +1450,12 @@ func TestCallFunction(t *testing.T) {
 
 		if goversion.VersionAfterOrEqual(runtime.Version(), 1, 17) {
 			for _, tc := range testcases117 {
+				testCallFunction(t, grp, p, tc)
+			}
+		}
+
+		if goversion.VersionAfterOrEqual(runtime.Version(), 1, 23) {
+			for _, tc := range testcases123 {
 				testCallFunction(t, grp, p, tc)
 			}
 		}
@@ -1486,8 +1506,15 @@ func testCallFunctionIntl(t *testing.T, grp *proc.TargetGroup, p *proc.Target, t
 		if err == nil {
 			t.Fatalf("call %q: expected error %q, got no error", tc.expr, tc.err.Error())
 		}
-		if tc.err.Error() != err.Error() {
-			t.Fatalf("call %q: expected error %q, got %q", tc.expr, tc.err.Error(), err.Error())
+		switch e := tc.err.(type) {
+		case *altError:
+			if !slices.Contains(e.errs, err.Error()) {
+				t.Fatalf("Unexpected error. Expected %s got %s", tc.err.Error(), err.Error())
+			}
+		default:
+			if tc.err.Error() != err.Error() {
+				t.Fatalf("call %q: expected error %q, got %q", tc.expr, tc.err.Error(), err.Error())
+			}
 		}
 		return
 	}
@@ -1551,6 +1578,62 @@ func testCallFunctionIntl(t *testing.T, grp *proc.TargetGroup, p *proc.Target, t
 	}
 }
 
+func TestIssue4051(t *testing.T) {
+	if testBackend == "rr" {
+		t.Skip("Skipping TestIssue4051 for rr backend due to Go runtime changes in newer versions")
+	}
+
+	protest.MustSupportFunctionCalls(t, testBackend)
+	protest.AllowRecording(t)
+	withTestProcess("issue4051", t, func(p *proc.Target, grp *proc.TargetGroup, fixture protest.Fixture) {
+		err := grp.Continue()
+		assertNoError(err, t, "initial continue to breakpoint failed")
+
+		err = proc.EvalExpressionWithCalls(grp, p.SelectedGoroutine(), `main.Hello("world")`, pnormalLoadConfig, true)
+		if err == nil {
+			t.Fatal("expected error, got nil")
+		}
+		expectedError := "package main has no function Hello"
+		if err.Error() != expectedError {
+			t.Fatalf("expected error %q, got %q", expectedError, err)
+		}
+
+		err = grp.Continue()
+		assertNoError(err, t, "initial continue to breakpoint failed")
+		err = proc.EvalExpressionWithCalls(grp, p.SelectedGoroutine(), `main.Hello("world")`, pnormalLoadConfig, true)
+		if err == nil {
+			t.Fatal("expected error, got nil")
+		}
+
+		expectedError = `expression "main.Hello" is not a function`
+		if err.Error() != expectedError {
+			t.Fatalf("expected error %q, got %q", expectedError, err)
+		}
+
+		v, err := evalVariableWithCfg(p, "main.Hello", pshortLoadConfig)
+		assertNoError(err, t, "eval of main.Hello returned an error")
+		assertVariable(t, v, varTest{"main.Hello", true, `"World"`, ``, `string`, nil})
+
+		v, err = evalVariableWithCfg(p, "os.a", pshortLoadConfig)
+		assertNoError(err, t, "eval of os.a returned an error")
+		assertVariable(t, v, varTest{"os.a", true, "1", ``, `int`, nil})
+
+		// TODO(deparker): we *should* get an error here, but the one we expect in this test
+		// is not the ideal error. We should really improve type checking in the evaluator.
+		v, err = evalVariableWithCfg(p, "main.f.func1.i", pshortLoadConfig)
+		expectedError = `main.f has no member func1`
+		if err.Error() != expectedError {
+			t.Fatalf("expected error %q, got %q", expectedError, err)
+		}
+
+		_, err = evalVariableWithCfg(p, "main.f.func1.somethingthatdoesntexist", pshortLoadConfig)
+		expectedError = `main.f has no member func1`
+		if err.Error() != expectedError {
+			t.Fatalf("expected error %q, got %q", expectedError, err)
+		}
+	})
+}
+
 func TestIssue1531(t *testing.T) {
 	// Go 1.12 introduced a change to the map representation where empty cells can be marked with 1 instead of just 0.
 	withTestProcess("issue1531", t, func(p *proc.Target, grp *proc.TargetGroup, fixture protest.Fixture) {
@@ -1561,14 +1644,7 @@ func TestIssue1531(t *testing.T) {
 			for i := 0; i < len(mv.Children); i += 2 {
 				cv := &mv.Children[i]
 				s := constant.StringVal(cv.Value)
-				found := false
-				for j := range keys {
-					if keys[j] == s {
-						found = true
-						break
-					}
-				}
-				if !found {
+				if !slices.Contains(keys, s) {
 					t.Errorf("key %q not allowed", s)
 					return
 				}
@@ -1925,14 +2001,7 @@ func TestClassicMap(t *testing.T) {
 					}
 					switch e := tc.err.(type) {
 					case *altError:
-						ok := false
-						for _, tgtErr := range e.errs {
-							if tgtErr == err.Error() {
-								ok = true
-								break
-							}
-						}
-						if !ok {
+						if !slices.Contains(e.errs, err.Error()) {
 							t.Fatalf("Unexpected error. Expected %s got %s", tc.err.Error(), err.Error())
 						}
 					default:
@@ -1956,5 +2025,92 @@ func TestCallFunctionRegisterArg(t *testing.T) {
 		setFileBreakpoint(p, t, fixture.Source, 12)
 		assertNoError(grp.Continue(), t, "Continue()")
 		assertNoError(proc.EvalExpressionWithCalls(grp, p.SelectedGoroutine(), "value.Type()", pnormalLoadConfig, true), t, "EvalExpressionWithCalls")
+	})
+}
+
+func TestCapturedVarVisibleOnFirstLine(t *testing.T) {
+	// Checks that a variable captured by a closure is visible on the first
+	// line of the closure function.
+	// See issue #4000
+	if !goversion.VersionAfterOrEqual(runtime.Version(), 1, 23) {
+		t.Skip("not implemented")
+	}
+	skipOn(t, "broken", "linux", "386")
+	withTestProcess("issue4000", t, func(p *proc.Target, grp *proc.TargetGroup, fixture protest.Fixture) {
+		addrs, err := proc.FindFileLocation(p, fixture.Source, 7)
+		assertNoError(err, t, "FindFileLocation")
+		found := false
+		for _, addr := range addrs {
+			_, _, fn := p.BinInfo().PCToLine(addr)
+			if fn != nil && strings.HasPrefix(fn.Name, "main.main.") {
+				found = true
+				_, err := p.SetBreakpoint(int(addr), addr, proc.UserBreakpoint, nil)
+				assertNoError(err, t, "SetBreakpoint")
+			}
+		}
+		if !found {
+			t.Fatal("could not find main.main.func1 at :7")
+		}
+		assertNoError(grp.Continue(), t, "Continue()") // this stops inside main.main.func1
+		v := evalVariable(p, t, "test")
+		cv := api.ConvertVar(v)
+		t.Logf("test variable: %s", cv.SinglelineString())
+		if tgt, s := `"a string"`, cv.SinglelineString(); s != tgt {
+			t.Fatalf("test variable expected %q got %q", tgt, s)
+		}
+	})
+}
+
+// See issue #4116
+func TestEmbeddedStructMethodsAndFieldLookup(t *testing.T) {
+	varTestcases := []varTest{
+		{"v.Model", true, "\"B\"", "", "string", nil},
+		{"v.A.Model", false, "main.(*A).Model", "", "func() string", nil},
+		{"v1.X", false, "main.(*B1).X", "", "func()", nil},
+		{"v1.A1.X", false, "0", "", "int", nil},
+		{"v2.X", false, "main.(*B2).X", "", "func()", nil},
+		{"v2.B2.X", false, "main.(*B2).X", "", "func()", nil},
+		{"v2.B2.A2.X", true, "0", "", "int", nil},
+		{"v2.A2.X", true, "0", "", "int", nil},
+		{"v7.X", false, "main.A7.X", "", "func()", nil},
+		{"x.X", false, "main.(*A7).X", "", "func()", nil},
+		{"x1.X", false, "", "", "", errors.New("x1 (type void) has no member X")},
+		{"x2.X", false, "main.(*A7).X", "", "func()", nil},
+		{"x3.X", false, "main.(*A7).X", "", "func()", nil},
+		{"v9.V.X", false, "main.(*B9).X", "", "func()", nil},
+		{"a.X", false, "main.A8.X", "", "func()", nil},
+		{"b.X", false, "", "", "", errors.New("b has no member X")},
+		{"c.X", false, "main.(*A8).X", "", "func()", nil},
+		{"d.X", true, "1", "", "int", nil},
+		{"v3.X", false, "main.(*B3).X", "", "func()", nil},
+		{"v3.B3.X", false, "main.(*B3).X", "", "func()", nil},
+		{"v4.X", false, "main.(*A4).X", "", "func()", nil},
+		{"v4.TestX.X", false, "main.(*A4).X", "", "func()", nil},
+		{"v5.X", true, "0", "", "int", nil},
+		{"v5.B5.X", false, "main.main.func1", "", "func() string", nil},
+		{"v5.B5.A5.X", false, "main.main.func1", "", "func() string", nil},
+		{"v5.A5.X", false, "main.main.func1", "", "func() string", nil},
+		{"*(ch.buf)", true, "[0]int []", "", "[0]int", nil},
+		{"*(v6.Chan.buf)", true, "[0]struct struct {} []", "", "[0]struct struct {}", nil},
+		{"*(v6.buf)", false, "", "", "", errors.New("v6 has no member buf")},
+	}
+
+	withTestProcess("issue4116", t, func(p *proc.Target, grp *proc.TargetGroup, fixture protest.Fixture) {
+		assertNoError(grp.Continue(), t, "Continue()")
+
+		for _, tc := range varTestcases {
+			variable, err := evalVariableWithCfg(p, tc.name, pnormalLoadConfig)
+			if tc.err == nil {
+				assertNoError(err, t, "EvalVariable() returned an error")
+				assertVariable(t, variable, tc)
+			} else {
+				if err == nil {
+					t.Fatalf("Expected error %s, got no error: %s\n", tc.err.Error(), api.ConvertVar(variable).SinglelineString())
+				}
+				if tc.err.Error() != err.Error() {
+					t.Fatalf("Unexpected error. Expected %s got %s", tc.err.Error(), err.Error())
+				}
+			}
+		}
 	})
 }

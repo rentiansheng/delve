@@ -3,6 +3,7 @@ package proc
 import (
 	"bytes"
 	"cmp"
+	"context"
 	"debug/dwarf"
 	"debug/elf"
 	"debug/macho"
@@ -24,6 +25,10 @@ import (
 	"sync"
 	"time"
 
+	"github.com/derekparker/trie/v3"
+	"github.com/hashicorp/golang-lru/v2"
+
+	"github.com/go-delve/delve/pkg/astutil"
 	pdwarf "github.com/go-delve/delve/pkg/dwarf"
 	"github.com/go-delve/delve/pkg/dwarf/frame"
 	"github.com/go-delve/delve/pkg/dwarf/godwarf"
@@ -36,12 +41,11 @@ import (
 	"github.com/go-delve/delve/pkg/logflags"
 	"github.com/go-delve/delve/pkg/proc/debuginfod"
 	"github.com/go-delve/delve/pkg/proc/evalop"
-	"github.com/hashicorp/golang-lru/simplelru"
 )
 
 const (
 	dwarfGoLanguage    = 22   // DW_LANG_Go (from DWARF v5, section 7.12, page 231)
-	dwarfAttrAddrBase  = 0x74 // debug/dwarf.AttrAddrBase in Go 1.14, defined here for compatibility with Go < 1.14
+	dwarfAttrAddrBase  = 0x73 // debug/dwarf.AttrAddrBase in Go 1.14, defined here for compatibility with Go < 1.14
 	dwarfTreeCacheSize = 512  // size of the dwarfTree cache of each image
 )
 
@@ -65,6 +69,8 @@ type BinaryInfo struct {
 	// lookupGenericFunc maps function names, with their type parameters removed, to functions.
 	// Functions that are not generic are not added to this map.
 	lookupGenericFunc map[string][]*Function
+	// lookupRangeBodyFunc maps function names to the range body functions.
+	lookupRangeBodyFunc *trie.Trie[*Function]
 
 	// SymNames maps addr to a description *elf.Symbol of this addr.
 	SymNames map[uint64]*elf.Symbol
@@ -114,6 +120,11 @@ type BinaryInfo struct {
 
 	debugPinnerFn *Function
 	logger        logflags.Logger
+	eventsFn      func(*Event)
+
+	cancelDownloadsMu sync.Mutex
+	cancelDownloads   func()
+	downloadsCtx      context.Context
 }
 
 var (
@@ -192,7 +203,14 @@ func FindFileLocation(p Process, filename string, lineno int) ([]uint64, error) 
 	}
 
 	if len(pcs) == 0 {
-		return nil, &ErrCouldNotFindLine{fileFound, filename, lineno}
+		stripped := false
+		for _, image := range bi.Images {
+			if image.Stripped() && image.symTable != nil && image.symTable.Files[filename] != nil {
+				stripped = true
+				break
+			}
+		}
+		return nil, &ErrCouldNotFindLine{fileFound, stripped, filename, lineno}
 	}
 
 	// 2. assign all occurrences of filename:lineno to their containing function
@@ -278,7 +296,7 @@ func FindFileLocation(p Process, filename string, lineno int) ([]uint64, error) 
 		}
 	}
 
-	sort.Slice(selectedPCs, func(i, j int) bool { return selectedPCs[i] < selectedPCs[j] })
+	slices.Sort(selectedPCs)
 
 	return selectedPCs, nil
 }
@@ -360,7 +378,7 @@ func FindFunctionLocation(p Process, funcName string, lineOffset int) ([]uint64,
 			return nil, &ErrFunctionNotFound{funcName}
 		}
 	}
-	sort.Slice(r, func(i, j int) bool { return r[i] < r[j] })
+	slices.Sort(r)
 	return r, nil
 }
 
@@ -565,10 +583,7 @@ func (fn *Function) PackageName() string {
 }
 
 func packageName(name string) string {
-	pathend := strings.LastIndex(name, "/")
-	if pathend < 0 {
-		pathend = 0
-	}
+	pathend := max(strings.LastIndex(name, "/"), 0)
 
 	if i := strings.Index(name[pathend:], "."); i != -1 {
 		return name[:pathend+i]
@@ -581,10 +596,7 @@ func packageName(name string) string {
 // Borrowed from $GOROOT/debug/gosym/symtab.go
 func (fn *Function) ReceiverName() string {
 	inst := fn.instRange()
-	pathend := strings.LastIndex(fn.Name[:inst[0]], "/")
-	if pathend < 0 {
-		pathend = 0
-	}
+	pathend := max(strings.LastIndex(fn.Name[:inst[0]], "/"), 0)
 	l := strings.Index(fn.Name[pathend:], ".")
 	if l == -1 {
 		return ""
@@ -763,9 +775,9 @@ func (fn *Function) extra(bi *BinaryInfo) *functionExtra {
 
 	// Find range-over-func bodies of this function
 	if fn.extraCache.rangeParent == nil {
-		for i := range bi.Functions {
-			fn2 := &bi.Functions[i]
-			if strings.HasPrefix(fn2.Name, fn.Name) && fn2.rangeParentName() == fn.Name {
+		lookupFunc := bi.LookupRangeBodyFunc()
+		for _, fn2 := range lookupFunc.PrefixSearchIter(fn.Name) {
+			if fn2.rangeParentName() == fn.Name {
 				fn.extraCache.rangeBodies = append(fn.extraCache.rangeBodies, fn2)
 			}
 		}
@@ -921,14 +933,20 @@ func (bi *BinaryInfo) PCToLine(pc uint64) (string, int, *Function) {
 }
 
 type ErrCouldNotFindLine struct {
-	fileFound bool
-	filename  string
-	lineno    int
+	fileFound, stripped bool
+	filename            string
+	lineno              int
 }
 
 func (err *ErrCouldNotFindLine) Error() string {
 	if err.fileFound {
+		if err.stripped {
+			return fmt.Sprintf("could not find statement at %s:%d, binary is stripped", err.filename, err.lineno)
+		}
 		return fmt.Sprintf("could not find statement at %s:%d, please use a line with a statement", err.filename, err.lineno)
+	}
+	if err.stripped {
+		return fmt.Sprintf("could not find file %s, binary is stripped", err.filename)
 	}
 	return fmt.Sprintf("could not find file %s", err.filename)
 }
@@ -996,7 +1014,7 @@ type Image struct {
 
 	compileUnits []*compileUnit // compileUnits is sorted by increasing DWARF offset
 
-	dwarfTreeCache  *simplelru.LRU
+	dwarfTreeCache  *lru.Cache[dwarf.Offset, *godwarf.Tree]
 	workaroundCache map[dwarf.Offset]*godwarf.Tree
 
 	// runtimeTypeToDIE maps between the offset of a runtime._type in
@@ -1012,7 +1030,7 @@ type Image struct {
 func (image *Image) registerRuntimeTypeToDIE(entry *dwarf.Entry, ardr *reader.Reader) {
 	if off, ok := entry.Val(godwarf.AttrGoRuntimeType).(uint64); ok {
 		if _, ok := image.runtimeTypeToDIE[off]; !ok {
-			image.runtimeTypeToDIE[off] = runtimeTypeDIE{entry.Offset, -1}
+			image.runtimeTypeToDIE[off] = runtimeTypeDIE{entry.Offset}
 		}
 	}
 }
@@ -1036,9 +1054,17 @@ func (bi *BinaryInfo) AddImage(path string, addr uint64) error {
 		}
 	}
 
+	if len(bi.Images) > 0 {
+		bi.cancelDownloadsMu.Lock()
+		if bi.cancelDownloads == nil {
+			bi.downloadsCtx, bi.cancelDownloads = context.WithCancel(context.Background())
+		}
+		bi.cancelDownloadsMu.Unlock()
+	}
+
 	// Actually add the image.
 	image := &Image{Path: path, addr: addr, typeCache: make(map[dwarf.Offset]godwarf.Type)}
-	image.dwarfTreeCache, _ = simplelru.NewLRU(dwarfTreeCacheSize, nil)
+	image.dwarfTreeCache, _ = lru.New[dwarf.Offset, *godwarf.Tree](dwarfTreeCacheSize)
 
 	// add Image regardless of error so that we don't attempt to re-add it every time we stop
 	image.index = len(bi.Images)
@@ -1046,6 +1072,21 @@ func (bi *BinaryInfo) AddImage(path string, addr uint64) error {
 	err := loadBinaryInfo(bi, image, path, addr)
 	if err != nil {
 		bi.Images[len(bi.Images)-1].loadErr = err
+	}
+	bi.macOSDebugFrameBugWorkaround()
+	return err
+}
+
+// LoadImageBinaryInfoAgain loads the n-th image debug symbols if they weren't already loaded.
+func (bi *BinaryInfo) LoadImageBinaryInfoAgain(n int) error {
+	if n < 0 || n >= len(bi.Images) || bi.Images[n].loadErr == nil {
+		return nil
+	}
+	image := bi.Images[n]
+	image.loadErr = nil
+	err := loadBinaryInfo(bi, image, image.Path, image.addr)
+	if err != nil {
+		image.loadErr = err
 	}
 	bi.macOSDebugFrameBugWorkaround()
 	return err
@@ -1136,7 +1177,7 @@ func (image *Image) Close() error {
 	return err2
 }
 
-func (image *Image) setLoadError(logger logflags.Logger, fmtstr string, args ...interface{}) {
+func (image *Image) setLoadError(logger logflags.Logger, fmtstr string, args ...any) {
 	image.loadErrMu.Lock()
 	image.loadErr = fmt.Errorf(fmtstr, args...)
 	image.loadErrMu.Unlock()
@@ -1155,7 +1196,7 @@ func (image *Image) getDwarfTree(off dwarf.Offset) (*godwarf.Tree, error) {
 		return image.workaroundCache[off], nil
 	}
 	if r, ok := image.dwarfTreeCache.Get(off); ok {
-		return r.(*godwarf.Tree), nil
+		return r, nil
 	}
 	r, err := godwarf.LoadTree(off, image.dwarf, image.StaticBase)
 	if err != nil {
@@ -1177,7 +1218,7 @@ func (bi *BinaryInfo) LoadImageFromData(dwdata *dwarf.Data, debugFrameBytes, deb
 	image.sepDebugCloser = (*nilCloser)(nil)
 	image.dwarf = dwdata
 	image.typeCache = make(map[dwarf.Offset]godwarf.Type)
-	image.dwarfTreeCache, _ = simplelru.NewLRU(dwarfTreeCacheSize, nil)
+	image.dwarfTreeCache, _ = lru.New[dwarf.Offset, *godwarf.Tree](dwarfTreeCacheSize)
 
 	if debugFrameBytes != nil {
 		bi.frameEntries, _ = frame.Parse(debugFrameBytes, frame.DwarfEndian(debugFrameBytes), 0, bi.Arch.PtrSize(), 0)
@@ -1372,6 +1413,19 @@ func (bi *BinaryInfo) Producer() string {
 	return ""
 }
 
+// DwarfVersion returns the maximum DWARF version in the executable.
+func (bi *BinaryInfo) DwarfVersion() uint8 {
+	r := uint8(0)
+	for _, so := range bi.Images {
+		for _, cu := range so.compileUnits {
+			if cu.isgo && cu.Version > r {
+				r = cu.Version
+			}
+		}
+	}
+	return r
+}
+
 // Type returns the Dwarf type entry at `offset`.
 func (image *Image) Type(offset dwarf.Offset) (godwarf.Type, error) {
 	return godwarf.ReadType(image.dwarf, image.index, offset, image.typeCache)
@@ -1416,6 +1470,17 @@ func (bi *BinaryInfo) parseDebugFrameGeneral(image *Image, debugFrameBytes []byt
 		}
 		bi.frameEntries = bi.frameEntries.Append(fe)
 	}
+}
+
+func (bi *BinaryInfo) getModuleData(mem MemoryReadWriter) ([]ModuleData, error) {
+	if bi.moduleDataCache == nil {
+		var err error
+		bi.moduleDataCache, err = LoadModuleData(bi, mem)
+		if err != nil {
+			return nil, fmt.Errorf("error loading module data: %v", err)
+		}
+	}
+	return bi.moduleDataCache, nil
 }
 
 // ELF ///////////////////////////////////////////////////////////////
@@ -1521,7 +1586,19 @@ func (bi *BinaryInfo) openSeparateDebugInfo(image *Image, exe *elf.File, debugIn
 	// has debuginfod so that we can use that in order to find any relevant debug information.
 	if debugFilePath == "" {
 		var err error
-		debugFilePath, err = debuginfod.GetDebuginfo(image.BuildID)
+		var notify func(string)
+		if bi.eventsFn != nil {
+			notify = func(s string) {
+				bi.eventsFn(&Event{
+					Kind: EventBinaryInfoDownload,
+					BinaryInfoDownloadEventDetails: &BinaryInfoDownloadEventDetails{
+						ImagePath: image.Path,
+						Progress:  s,
+					},
+				})
+			}
+		}
+		debugFilePath, err = debuginfod.GetDebuginfo(bi.downloadsCtx, notify, image.BuildID)
 		if err != nil {
 			return nil, nil, ErrNoDebugInfoFound
 		}
@@ -2202,6 +2279,7 @@ func loadBinaryInfoGoRuntimeElf(bi *BinaryInfo, image *Image, path string, elfFi
 	defer func() {
 		ierr := recover()
 		if ierr != nil {
+			logflags.Bug.Inc()
 			err = fmt.Errorf("error loading binary info from Go runtime: %v", ierr)
 		}
 	}()
@@ -2244,6 +2322,7 @@ func loadBinaryInfoGoRuntimeMacho(bi *BinaryInfo, image *Image, path string, exe
 	defer func() {
 		ierr := recover()
 		if ierr != nil {
+			logflags.Bug.Inc()
 			err = fmt.Errorf("error loading binary info from Go runtime: %v", ierr)
 		}
 	}()
@@ -2374,10 +2453,10 @@ func (bi *BinaryInfo) findTypeExpr(expr ast.Expr) (godwarf.Type, error) {
 		alen, litlen := anode.Len.(*ast.BasicLit)
 		if litlen && alen.Kind == token.INT {
 			n, _ := strconv.Atoi(alen.Value)
-			return bi.findArrayType(n, exprToString(anode.Elt))
+			return bi.findArrayType(n, astutil.ExprToString(anode.Elt))
 		}
 	}
-	return bi.findType(exprToString(expr))
+	return bi.findType(astutil.ExprToString(expr))
 }
 
 func (bi *BinaryInfo) findArrayType(n int, etyp string) (godwarf.Type, error) {
@@ -2488,7 +2567,7 @@ func (bi *BinaryInfo) loadDebugInfoMaps(image *Image, debugInfoBytes, debugLineB
 			}
 			lineInfoOffset, hasLineInfo := entry.Val(dwarf.AttrStmtList).(int64)
 			if hasLineInfo && lineInfoOffset >= 0 && lineInfoOffset < int64(len(debugLineBytes)) {
-				var logfn func(string, ...interface{})
+				var logfn func(string, ...any)
 				if logflags.DebugLineErrors() {
 					logfn = logflags.DebugLineLogger().Debugf
 				}
@@ -2544,6 +2623,7 @@ func (bi *BinaryInfo) loadDebugInfoMaps(image *Image, debugInfoBytes, debugLineB
 
 	bi.lookupFunc = nil
 	bi.lookupGenericFunc = nil
+	bi.lookupRangeBodyFunc = nil
 
 	for _, cu := range image.compileUnits {
 		if cu.lineInfo != nil {
@@ -2587,6 +2667,16 @@ func (bi *BinaryInfo) LookupFunc() map[string][]*Function {
 		}
 	}
 	return bi.lookupFunc
+}
+
+func (bi *BinaryInfo) LookupRangeBodyFunc() *trie.Trie[*Function] {
+	if bi.lookupRangeBodyFunc == nil {
+		bi.lookupRangeBodyFunc = trie.New[*Function]()
+		for i := range bi.Functions {
+			bi.lookupRangeBodyFunc.Add(bi.Functions[i].Name, &bi.Functions[i])
+		}
+	}
+	return bi.lookupRangeBodyFunc
 }
 
 func (bi *BinaryInfo) lookupOneFunc(name string) *Function {
@@ -2932,10 +3022,7 @@ func (bi *BinaryInfo) expandPackagesInType(expr ast.Expr) {
 // elements of the path except the first one) like Go does in variable and
 // type names.
 func escapePackagePath(pkg string) string {
-	slash := strings.Index(pkg, "/")
-	if slash < 0 {
-		slash = 0
-	}
+	slash := max(strings.Index(pkg, "/"), 0)
 	return pkg[:slash] + strings.ReplaceAll(pkg[slash:], ".", "%2e")
 }
 

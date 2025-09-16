@@ -47,7 +47,8 @@ type gdbConn struct {
 	goarch                string
 	goos                  string
 
-	useXcmd bool // forces writeMemory to use the 'X' command
+	useXcmd       bool // forces writeMemory to use the 'X' command
+	newRRCmdStyle bool // forces qRRCmd to use the post-5.8.0 style always
 
 	log logflags.Logger
 }
@@ -393,7 +394,7 @@ func (conn *gdbConn) readAuxv() ([]byte, error) {
 func (conn *gdbConn) qXfer(kind, annex string, binary bool) ([]byte, error) {
 	out := []byte{}
 	for {
-		cmd := []byte(fmt.Sprintf("$qXfer:%s:read:%s:%x,fff", kind, annex, len(out)))
+		cmd := fmt.Appendf(nil, "$qXfer:%s:read:%s:%x,fff", kind, annex, len(out))
 		err := conn.send(cmd)
 		if err != nil {
 			return nil, err
@@ -531,6 +532,10 @@ func (conn *gdbConn) readRegister(threadID string, regnum int, data []byte) erro
 	resp, err := conn.exec(conn.outbuf.Bytes(), "register read")
 	if err != nil {
 		return err
+	}
+
+	if len(resp) > len(data)*2 {
+		return fmt.Errorf("wrong response length, expected %d got %d", len(data)*2, len(resp))
 	}
 
 	for i := 0; i < len(resp); i += 2 {
@@ -1194,7 +1199,7 @@ func (conn *gdbConn) qRRCmd(args ...string) (string, error) {
 	fmt.Fprint(&conn.outbuf, "$qRRCmd")
 	for i, arg := range args {
 		fmt.Fprint(&conn.outbuf, ":")
-		if i == 0 && conn.threadSuffixSupported {
+		if i == 0 && (conn.newRRCmdStyle || conn.threadSuffixSupported) {
 			// newer versions of RR require the command to be followed by a thread id
 			// and the command name to be unescaped.
 			fmt.Fprintf(&conn.outbuf, "%s:-1", arg)
@@ -1504,7 +1509,7 @@ func wiredecode(in, buf []byte) (newbuf, msg []byte) {
 			} else {
 				n := in[i+1] - 29
 				r := buf[len(buf)-1]
-				for j := uint8(0); j < n; j++ {
+				for range n {
 					buf = append(buf, r)
 				}
 				i++

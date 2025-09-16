@@ -43,6 +43,8 @@ const (
 	maxMapBucketsFactor = 100 // Maximum numbers of map buckets to read for every requested map entry when loading variables through (*EvalScope).LocalVariables and (*EvalScope).FunctionArguments.
 
 	maxGoroutineUserCurrentDepth = 30 // Maximum depth used by (*G).UserCurrent to search its location
+
+	maxGoroutinesLabelEntries = 1_000 // Maximum number of label entries for a goroutine's label map
 )
 
 type floatSpecial uint8
@@ -257,7 +259,8 @@ func GetG(thread Thread) (*G, error) {
 	if thread.Common().g != nil {
 		return thread.Common().g, nil
 	}
-	if loc, _ := thread.Location(); loc != nil && loc.Fn != nil && loc.Fn.Name == "runtime.clone" {
+	loc, _ := ThreadLocation(thread)
+	if loc != nil && loc.Fn != nil && loc.Fn.Name == "runtime.clone" {
 		// When threads are executing runtime.clone the value of TLS is unreliable.
 		return nil, nil
 	}
@@ -296,7 +299,7 @@ func GetG(thread Thread) (*G, error) {
 		g.SystemStack = true
 	}
 	g.Thread = thread
-	if loc, err := thread.Location(); err == nil {
+	if err == nil {
 		g.CurrentLoc = *loc
 	}
 	thread.Common().g = g
@@ -354,7 +357,7 @@ func GoroutinesInfo(dbp *Target, start, count int) ([]*G, int, error) {
 			continue
 		}
 		if thg, allocated := threadg[g.ID]; allocated {
-			loc, err := thg.Thread.Location()
+			loc, err := ThreadLocation(thg.Thread)
 			if err != nil {
 				return nil, -1, err
 			}
@@ -584,6 +587,13 @@ func (g *G) Labels() map[string]string {
 				case reflect.Struct:
 					labelMap, _ = labelMap.structMember("list")
 					if labelMap != nil {
+						// ensure the labelMap.Len is a valid value to prevent infinite loops
+						if labelMap.Len < 0 {
+							labelMap.Len = 0
+						}
+						if labelMap.Len > maxGoroutinesLabelEntries {
+							labelMap.Len = maxGoroutinesLabelEntries
+						}
 						for i := int64(0); i < labelMap.Len; i++ {
 							v, err := labelMap.sliceAccess(int(i))
 							if err != nil {
@@ -591,6 +601,12 @@ func (g *G) Labels() map[string]string {
 							}
 							v.loadValue(loadFullValue)
 							if len(v.Children) == 2 {
+								// Skip invalid key-value pairs caused by corrupted or incompatible label structures
+								// (e.g., labels set by some libraries: https://github.com/timandy/routine/blob/v1.1.4/goid.go#L50).
+								// This prevents panics when converting nil values via constant.StringVal().
+								if v.Children[0].Value == nil || v.Children[1].Value == nil {
+									continue
+								}
 								labels[constant.StringVal(v.Children[0].Value)] = constant.StringVal(v.Children[1].Value)
 							}
 						}
@@ -664,7 +680,7 @@ func newVariable(name string, addr uint64, dwarfType godwarf.Type, bi *BinaryInf
 		bi:        bi,
 	}
 
-	v.RealType = resolveTypedef(v.DwarfType)
+	v.RealType = godwarf.ResolveTypedef(v.DwarfType)
 
 	switch t := v.RealType.(type) {
 	case *godwarf.PtrType:
@@ -758,23 +774,10 @@ func newVariable(name string, addr uint64, dwarfType godwarf.Type, bi *BinaryInf
 	return v
 }
 
-func resolveTypedef(typ godwarf.Type) godwarf.Type {
-	for {
-		switch tt := typ.(type) {
-		case *godwarf.TypedefType:
-			typ = tt.Type
-		case *godwarf.QualType:
-			typ = tt.Type
-		default:
-			return typ
-		}
-	}
-}
-
 var constantMaxInt64 = constant.MakeInt64(1<<63 - 1)
 
-func newConstant(val constant.Value, mem MemoryReadWriter) *Variable {
-	v := &Variable{Value: val, mem: mem, loaded: true}
+func newConstant(val constant.Value, bi *BinaryInfo, mem MemoryReadWriter) *Variable {
+	v := &Variable{Value: val, mem: mem, loaded: true, bi: bi}
 	switch val.Kind() {
 	case constant.Int:
 		v.Kind = reflect.Int
@@ -895,9 +898,18 @@ func (v *Variable) parseG() (*G, error) {
 	if schedVar == nil {
 		return nil, ErrUnreadableG
 	}
-	pc, _ := constant.Int64Val(schedVar.fieldVariable("pc").Value) // +rtype uintptr
-	sp, _ := constant.Int64Val(schedVar.fieldVariable("sp").Value) // +rtype uintptr
-	var bp, lr int64
+
+	var pc, sp, bp, lr int64
+	if pcvar := schedVar.fieldVariable("pc"); /* +rtype uintptr */ pcvar != nil && pcvar.Value != nil {
+		pc, _ = constant.Int64Val(pcvar.Value)
+	} else {
+		return nil, ErrUnreadableG
+	}
+	if spvar := schedVar.fieldVariable("sp"); /* +rtype uintptr */ spvar != nil && spvar.Value != nil {
+		sp, _ = constant.Int64Val(spvar.Value)
+	} else {
+		return nil, ErrUnreadableG
+	}
 	if bpvar := schedVar.fieldVariable("bp"); /* +rtype -opt uintptr */ bpvar != nil && bpvar.Value != nil {
 		bp, _ = constant.Int64Val(bpvar.Value)
 	}
@@ -1111,6 +1123,9 @@ func (v *Variable) structMember(memberName string) (*Variable, error) {
 		return v.clone(), nil
 	}
 	vname := v.Name
+	if v.Name == "" {
+		vname = v.DwarfType.String()
+	}
 	if v.loaded && (v.Flags&VariableFakeAddress) != 0 {
 		for i := range v.Children {
 			if v.Children[i].Name == memberName {
@@ -1123,19 +1138,28 @@ func (v *Variable) structMember(memberName string) (*Variable, error) {
 	switch v.Kind {
 	case reflect.Chan:
 		v = v.clone()
-		v.RealType = resolveTypedef(&(v.RealType.(*godwarf.ChanType).TypedefType))
+		v.RealType = godwarf.ResolveTypedef(&(v.RealType.(*godwarf.ChanType).TypedefType))
 	case reflect.Interface:
 		v.loadInterface(0, false, LoadConfig{})
 		if len(v.Children) > 0 {
 			v = &v.Children[0]
 		}
 	case reflect.Func:
+		fn := v.bi.PCToFunc(v.Base)
 		v.loadFunctionPtr(0, LoadConfig{MaxVariableRecurse: -1})
 		if v.Unreadable != nil {
+			cst := fn.extra(v.bi).closureStructType
+			if cst == nil || cst.ByteSize == 0 {
+				// Not a closure, normal function
+				if _, ok := v.bi.PackageMap[vname]; ok {
+					return nil, fmt.Errorf("package %s has no function %s", vname, memberName)
+				}
+				return nil, fmt.Errorf("%s has no member %s", vname, memberName)
+			}
 			return nil, v.Unreadable
 		}
 		if v.closureAddr != 0 {
-			fn := v.bi.PCToFunc(v.Base)
+			fn = v.bi.PCToFunc(v.Base)
 			if fn != nil {
 				cst := fn.extra(v.bi).closureStructType
 				v = v.newVariable(v.Name, v.closureAddr, cst, v.mem)
@@ -1354,7 +1378,7 @@ func (v *Variable) loadValueInternal(recurseLevel int, cfg LoadConfig) {
 			if v.Children[0].Kind == reflect.Interface {
 				nextLvl++
 			} else if ptyp, isptr := v.RealType.(*godwarf.PtrType); isptr {
-				_, elemTypIsPtr := resolveTypedef(ptyp.Type).(*godwarf.PtrType)
+				_, elemTypIsPtr := godwarf.ResolveTypedef(ptyp.Type).(*godwarf.PtrType)
 				if elemTypIsPtr {
 					nextLvl++
 					checkLvl = true
@@ -1371,7 +1395,7 @@ func (v *Variable) loadValueInternal(recurseLevel int, cfg LoadConfig) {
 
 	case reflect.Chan:
 		sv := v.clone()
-		sv.RealType = resolveTypedef(&(sv.RealType.(*godwarf.ChanType).TypedefType))
+		sv.RealType = godwarf.ResolveTypedef(&(sv.RealType.(*godwarf.ChanType).TypedefType))
 		sv = sv.maybeDereference()
 		sv.loadValueInternal(0, loadFullValue)
 		v.Children = sv.Children
@@ -1508,11 +1532,11 @@ func convertToEface(srcv, dstv *Variable) error {
 		dstv.writeEmptyInterface(_type.Addr, data)
 		return nil
 	}
-	typeAddr, typeKind, runtimeTypeFound, err := dwarfToRuntimeType(srcv.bi, srcv.mem, srcv.RealType)
+	typeAddr, direct, runtimeTypeFound, err := dwarfToRuntimeType(srcv.bi, srcv.mem, srcv.RealType)
 	if err != nil {
 		return fmt.Errorf("can not convert value of type %s to %s: %v", srcv.DwarfType.String(), dstv.DwarfType.String(), err)
 	}
-	if !runtimeTypeFound || typeKind&kindDirectIface == 0 {
+	if !runtimeTypeFound || !direct {
 		return &typeConvErr{srcv.DwarfType, dstv.RealType}
 	}
 	return dstv.writeEmptyInterface(typeAddr, srcv)
@@ -1557,10 +1581,7 @@ func readStringValue(mem MemoryReadWriter, addr uint64, strlen int64, cfg LoadCo
 		return "", nil
 	}
 
-	count := strlen
-	if count > int64(cfg.MaxStringLen) {
-		count = int64(cfg.MaxStringLen)
-	}
+	count := min(strlen, int64(cfg.MaxStringLen))
 
 	val := make([]byte, int(count))
 	_, err := mem.ReadMemory(val, addr)
@@ -1585,10 +1606,7 @@ func readCStringValue(mem MemoryReadWriter, addr uint64, cfg LoadConfig) (string
 		// divisor for all architectures.
 		curaddr := addr + uint64(len(val))
 		maxsize := int(alignAddr(int64(curaddr+1), 1024) - int64(curaddr))
-		size := len(buf)
-		if size > maxsize {
-			size = maxsize
-		}
+		size := min(len(buf), maxsize)
 
 		_, err := mem.ReadMemory(buf[:size], curaddr)
 		if err != nil {
@@ -1661,6 +1679,10 @@ func (v *Variable) loadSliceInfo(t *godwarf.SliceType) {
 		}
 	}
 
+	if v.Addr == fakeAddressUnresolv && v.fieldType == nil {
+		return
+	}
+
 	v.stride = v.fieldType.Size()
 	if t, ok := v.fieldType.(*godwarf.PtrType); ok {
 		v.stride = t.ByteSize
@@ -1676,7 +1698,7 @@ func (v *Variable) loadChanInfo() {
 		return
 	}
 	sv := v.clone()
-	sv.RealType = resolveTypedef(&(chanType.TypedefType))
+	sv.RealType = godwarf.ResolveTypedef(&(chanType.TypedefType))
 	sv = sv.maybeDereference()
 	if sv.Unreadable != nil || sv.Addr == 0 {
 		return
@@ -2067,7 +2089,7 @@ func (v *Variable) readInterface() (_type, data *Variable, isnil bool) {
 
 	v.mem = cacheMemory(v.mem, v.Addr, int(v.RealType.Size()))
 
-	ityp := resolveTypedef(&v.RealType.(*godwarf.InterfaceType).TypedefType).(*godwarf.StructType)
+	ityp := godwarf.ResolveTypedef(&v.RealType.(*godwarf.InterfaceType).TypedefType).(*godwarf.StructType)
 
 	// +rtype -field iface.tab *itab|*internal/abi.ITab
 	// +rtype -field iface.data unsafe.Pointer
@@ -2119,21 +2141,21 @@ func (v *Variable) loadInterface(recurseLevel int, loadData bool, cfg LoadConfig
 		return
 	}
 
-	mds, err := LoadModuleData(_type.bi, _type.mem)
+	mds, err := _type.bi.getModuleData(_type.mem)
 	if err != nil {
 		v.Unreadable = fmt.Errorf("error loading module data: %v", err)
 		return
 	}
 
-	typ, kind, err := RuntimeTypeToDIE(_type, data.Addr, mds)
+	typ, directIface, err := RuntimeTypeToDIE(_type, data.Addr, mds)
 	if err != nil {
 		v.Unreadable = err
 		return
 	}
 
 	deref := false
-	if kind&kindDirectIface == 0 {
-		realtyp := resolveTypedef(typ)
+	if !directIface {
+		realtyp := godwarf.ResolveTypedef(typ)
 		if _, isptr := realtyp.(*godwarf.PtrType); !isptr {
 			typ = pointerTo(typ, v.bi.Arch)
 			deref = true
@@ -2187,47 +2209,47 @@ func (v *Variable) registerVariableTypeConv(newtyp string) (*Variable, error) {
 		var child *Variable
 		switch newtyp {
 		case "int8":
-			child = newConstant(constant.MakeInt64(int64(int8(v.reg.Bytes[i]))), v.mem)
+			child = newConstant(constant.MakeInt64(int64(int8(v.reg.Bytes[i]))), v.bi, v.mem)
 			child.Kind = reflect.Int8
 			n = 1
 		case "int16":
-			child = newConstant(constant.MakeInt64(int64(int16(binary.LittleEndian.Uint16(v.reg.Bytes[i:])))), v.mem)
+			child = newConstant(constant.MakeInt64(int64(int16(binary.LittleEndian.Uint16(v.reg.Bytes[i:])))), v.bi, v.mem)
 			child.Kind = reflect.Int16
 			n = 2
 		case "int32":
-			child = newConstant(constant.MakeInt64(int64(int32(binary.LittleEndian.Uint32(v.reg.Bytes[i:])))), v.mem)
+			child = newConstant(constant.MakeInt64(int64(int32(binary.LittleEndian.Uint32(v.reg.Bytes[i:])))), v.bi, v.mem)
 			child.Kind = reflect.Int32
 			n = 4
 		case "int64":
-			child = newConstant(constant.MakeInt64(int64(binary.LittleEndian.Uint64(v.reg.Bytes[i:]))), v.mem)
+			child = newConstant(constant.MakeInt64(int64(binary.LittleEndian.Uint64(v.reg.Bytes[i:]))), v.bi, v.mem)
 			child.Kind = reflect.Int64
 			n = 8
 		case "uint8":
-			child = newConstant(constant.MakeUint64(uint64(v.reg.Bytes[i])), v.mem)
+			child = newConstant(constant.MakeUint64(uint64(v.reg.Bytes[i])), v.bi, v.mem)
 			child.Kind = reflect.Uint8
 			n = 1
 		case "uint16":
-			child = newConstant(constant.MakeUint64(uint64(binary.LittleEndian.Uint16(v.reg.Bytes[i:]))), v.mem)
+			child = newConstant(constant.MakeUint64(uint64(binary.LittleEndian.Uint16(v.reg.Bytes[i:]))), v.bi, v.mem)
 			child.Kind = reflect.Uint16
 			n = 2
 		case "uint32":
-			child = newConstant(constant.MakeUint64(uint64(binary.LittleEndian.Uint32(v.reg.Bytes[i:]))), v.mem)
+			child = newConstant(constant.MakeUint64(uint64(binary.LittleEndian.Uint32(v.reg.Bytes[i:]))), v.bi, v.mem)
 			child.Kind = reflect.Uint32
 			n = 4
 		case "uint64":
-			child = newConstant(constant.MakeUint64(binary.LittleEndian.Uint64(v.reg.Bytes[i:])), v.mem)
+			child = newConstant(constant.MakeUint64(binary.LittleEndian.Uint64(v.reg.Bytes[i:])), v.bi, v.mem)
 			child.Kind = reflect.Uint64
 			n = 8
 		case "float32":
 			a := binary.LittleEndian.Uint32(v.reg.Bytes[i:])
 			x := *(*float32)(unsafe.Pointer(&a))
-			child = newConstant(constant.MakeFloat64(float64(x)), v.mem)
+			child = newConstant(constant.MakeFloat64(float64(x)), v.bi, v.mem)
 			child.Kind = reflect.Float32
 			n = 4
 		case "float64":
 			a := binary.LittleEndian.Uint64(v.reg.Bytes[i:])
 			x := *(*float64)(unsafe.Pointer(&a))
-			child = newConstant(constant.MakeFloat64(x), v.mem)
+			child = newConstant(constant.MakeFloat64(x), v.bi, v.mem)
 			child.Kind = reflect.Float64
 			n = 8
 		default:
@@ -2243,7 +2265,7 @@ func (v *Variable) registerVariableTypeConv(newtyp string) (*Variable, error) {
 				}
 				n = n / 8
 			}
-			child = newConstant(constant.MakeString(fmt.Sprintf("%x", v.reg.Bytes[i:][:n])), v.mem)
+			child = newConstant(constant.MakeString(fmt.Sprintf("%x", v.reg.Bytes[i:][:n])), v.bi, v.mem)
 		}
 		v.Children = append(v.Children, *child)
 	}

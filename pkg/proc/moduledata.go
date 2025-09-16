@@ -69,7 +69,7 @@ func LoadModuleData(bi *BinaryInfo, mem MemoryReadWriter) ([]ModuleData, error) 
 	return r, nil
 }
 
-func findModuleDataForType(bi *BinaryInfo, mds []ModuleData, typeAddr uint64, mem MemoryReadWriter) *ModuleData {
+func findModuleDataForType(mds []ModuleData, typeAddr uint64) *ModuleData {
 	for i := range mds {
 		if typeAddr >= mds[i].types && typeAddr < mds[i].etypes {
 			return &mds[i]

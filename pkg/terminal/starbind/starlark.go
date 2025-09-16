@@ -15,6 +15,7 @@ import (
 	"go.starlark.net/starlark"
 	"go.starlark.net/syntax"
 
+	"github.com/go-delve/delve/pkg/logflags"
 	"github.com/go-delve/delve/service"
 	"github.com/go-delve/delve/service/api"
 )
@@ -30,6 +31,7 @@ const (
 	dlvContextName               = "dlv_context"
 	curScopeBuiltinName          = "cur_scope"
 	defaultLoadConfigBuiltinName = "default_load_config"
+	targetObjectName             = "tgt"
 	helpBuiltinName              = "help"
 )
 
@@ -138,6 +140,8 @@ func New(ctx Context, out EchoWriter) *Env {
 	})
 	builtindoc(defaultLoadConfigBuiltinName, "()", "returns the default load configuration.")
 
+	env.env[targetObjectName] = starlarkTargetObject{env}
+
 	env.env[helpBuiltinName] = starlark.NewBuiltin(helpBuiltinName, func(_ *starlark.Thread, _ *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
 		switch len(args) {
 		case 0:
@@ -153,6 +157,7 @@ func New(ctx Context, out EchoWriter) *Env {
 			for _, bin := range bins {
 				fmt.Fprintf(env.out, "\t%s\n", bin)
 			}
+			fmt.Fprintf(env.out, "\n\nUse tgt.varname to access the varname variable in the target process (it is equivalent to 'eval(None, \"varname\").Variable.Value').\n")
 		case 1:
 			switch x := args[0].(type) {
 			case *starlark.Builtin:
@@ -196,12 +201,13 @@ func (env *Env) printFunc() func(_ *starlark.Thread, msg string) {
 // Source can be either a []byte, a string or a io.Reader. If source is nil
 // Execute will execute the file specified by 'path'.
 // After the file is executed if a function named mainFnName exists it will be called, passing args to it.
-func (env *Env) Execute(path string, source interface{}, mainFnName string, args []interface{}) (_ starlark.Value, _err error) {
+func (env *Env) Execute(path string, source any, mainFnName string, args []any) (_ starlark.Value, _err error) {
 	defer func() {
 		err := recover()
 		if err == nil {
 			return
 		}
+		logflags.Bug.Inc()
 		_err = fmt.Errorf("panic executing starlark script: %v", err)
 		fmt.Fprintf(env.out, "panic executing starlark script: %v\n", err)
 		for i := 0; ; i++ {
@@ -319,7 +325,7 @@ func (env *Env) createCommand(name string, val starlark.Value) error {
 }
 
 // callMain calls the main function in globals, if one was defined.
-func (env *Env) callMain(thread *starlark.Thread, globals starlark.StringDict, mainFnName string, args []interface{}) (starlark.Value, error) {
+func (env *Env) callMain(thread *starlark.Thread, globals starlark.StringDict, mainFnName string, args []any) (starlark.Value, error) {
 	if mainFnName == "" {
 		return starlark.None, nil
 	}

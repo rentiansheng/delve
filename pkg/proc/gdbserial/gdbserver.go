@@ -200,6 +200,7 @@ func (err *ErrBackendUnavailable) Error() string {
 type gdbRegisters struct {
 	regs     map[string]gdbRegister
 	regsInfo []gdbRegisterInfo
+	loaded   []bool
 	tls      uint64
 	gaddr    uint64
 	hasgaddr bool
@@ -445,7 +446,7 @@ func getLdEnvVars() []string {
 	var result []string
 
 	environ := os.Environ()
-	for i := 0; i < len(environ); i++ {
+	for i := range environ {
 		if strings.HasPrefix(environ[i], "LD_") ||
 			strings.HasPrefix(environ[i], "DYLD_") {
 			result = append(result, "-e", environ[i])
@@ -1523,22 +1524,6 @@ func (t *gdbThread) ProcessMemory() proc.MemoryReadWriter {
 	return t.p
 }
 
-// Location returns the current location of this thread.
-func (t *gdbThread) Location() (*proc.Location, error) {
-	regs, err := t.Registers()
-	if err != nil {
-		return nil, err
-	}
-	if pcreg, ok := regs.(*gdbRegisters).regs[regs.(*gdbRegisters).regnames.PC]; !ok {
-		t.p.conn.log.Errorf("thread %d could not find RIP register", t.ID)
-	} else if len(pcreg.value) < t.p.bi.Arch.PtrSize() {
-		t.p.conn.log.Errorf("thread %d bad length for RIP register: %d", t.ID, len(pcreg.value))
-	}
-	pc := regs.PC()
-	f, l, fn := t.p.bi.PCToLine(pc)
-	return &proc.Location{PC: pc, File: f, Line: l, Fn: fn}, nil
-}
-
 // Breakpoint returns the current active breakpoint for this thread.
 func (t *gdbThread) Breakpoint() *proc.BreakpointState {
 	return &t.CurrentBreakpoint
@@ -1683,6 +1668,7 @@ func (regs *gdbRegisters) init(regsInfo []gdbRegisterInfo, arch *proc.Arch, regn
 	regs.regnames = regnames
 	regs.regs = make(map[string]gdbRegister)
 	regs.regsInfo = regsInfo
+	regs.loaded = make([]bool, len(regsInfo))
 
 	regsz := 0
 	for _, reginfo := range regsInfo {
@@ -1718,17 +1704,27 @@ func (t *gdbThread) reloadRegisters(regs map[uint64]uint64) error {
 				} else {
 					return err
 				}
+			} else {
+				for i := range t.regs.loaded {
+					t.regs.loaded[i] = true
+				}
 			}
 		}
 		if !t.p.gcmdok {
-			for _, reginfo := range t.p.conn.regsInfo {
+			for i, reginfo := range t.p.conn.regsInfo {
+				t.regs.loaded[i] = true
 				if err := t.p.conn.readRegister(t.strID, reginfo.Regnum, t.regs.regs[reginfo.Name].value); err != nil {
-					return err
+					logflags.DebuggerLogger().Errorf("Could not read register %s: %v\n", reginfo.Name, err)
+					for i := range t.regs.regs[reginfo.Name].value {
+						t.regs.regs[reginfo.Name].value[i] = 0
+					}
+					t.regs.loaded[i] = false
 				}
 			}
 		}
 	} else {
-		for _, r := range t.p.conn.regsInfo {
+		for i, r := range t.p.conn.regsInfo {
+			t.regs.loaded[i] = true
 			if val, ok := regs[uint64(r.Regnum)]; ok {
 				switch r.Bitsize / 8 {
 				case 8:
@@ -1738,7 +1734,11 @@ func (t *gdbThread) reloadRegisters(regs map[uint64]uint64) error {
 				}
 			} else {
 				if err := t.p.conn.readRegister(t.strID, r.Regnum, t.regs.regs[r.Name].value); err != nil {
-					return err
+					logflags.DebuggerLogger().Errorf("Could not read register %s: %v\n", r.Name, err)
+					for i := range t.regs.regs[r.Name].value {
+						t.regs.regs[r.Name].value[i] = 0
+					}
+					t.regs.loaded[i] = false
 				}
 			}
 		}
@@ -1791,8 +1791,9 @@ func (t *gdbThread) writeRegisters() error {
 			return err
 		}
 	}
-	for _, r := range t.regs.regs {
-		if r.ignoreOnWrite {
+	for i, reginfo := range t.regs.regsInfo {
+		r := t.regs.regs[reginfo.Name]
+		if r.ignoreOnWrite || !t.regs.loaded[i] {
 			continue
 		}
 		if err := t.p.conn.writeRegister(t.strID, r.regnum, r.value); err != nil {
@@ -2209,6 +2210,7 @@ func (regs *gdbRegisters) Copy() (proc.Registers, error) {
 	savedRegs := &gdbRegisters{}
 	savedRegs.init(regs.regsInfo, regs.arch, regs.regnames)
 	copy(savedRegs.buf, regs.buf)
+	copy(savedRegs.loaded, regs.loaded)
 	return savedRegs, nil
 }
 

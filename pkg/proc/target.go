@@ -252,7 +252,7 @@ func (t *Target) Valid() (bool, error) {
 // Currently only non-recorded processes running on AMD64 support
 // function calls.
 func (t *Target) SupportsFunctionCalls() bool {
-	return t.Process.BinInfo().Arch.Name == "amd64" || (t.Process.BinInfo().Arch.Name == "arm64" && t.Process.BinInfo().GOOS != "windows") || t.Process.BinInfo().Arch.Name == "ppc64le"
+	return t.Process.BinInfo().Arch.Name == "amd64" || (t.Process.BinInfo().Arch.Name == "arm64" && t.Process.BinInfo().GOOS != "windows") || t.Process.BinInfo().Arch.Name == "ppc64le" || t.Process.BinInfo().Arch.Name == "loong64"
 }
 
 // ClearCaches clears internal caches that should not survive a restart.
@@ -356,7 +356,7 @@ func setAsyncPreemptOff(p *Target, v int64) {
 	p.asyncPreemptChanged = true
 	p.asyncPreemptOff, _ = constant.Int64Val(asyncpreemptoffv.Value)
 
-	err = scope.setValue(asyncpreemptoffv, newConstant(constant.MakeInt64(v), scope.Mem), "")
+	err = scope.setValue(asyncpreemptoffv, newConstant(constant.MakeInt64(v), scope.BinInfo, scope.Mem), "")
 	if err != nil {
 		logger.Warnf("could not set asyncpreemptoff %v", err)
 	}
@@ -578,13 +578,27 @@ func (t *Target) dwrapUnwrap(fn *Function) *Function {
 func (t *Target) pluginOpenCallback(Thread, *Target) (bool, error) {
 	logger := logflags.DebuggerLogger()
 	for _, lbp := range t.Breakpoints().Logical {
-		if isSuspended(t, lbp) {
-			err := enableBreakpointOnTarget(t, lbp)
-			if err != nil {
-				logger.Debugf("could not enable breakpoint %d: %v", lbp.LogicalID, err)
-			} else {
-				logger.Debugf("suspended breakpoint %d enabled", lbp.LogicalID)
-			}
+		// If the breakpoint is suspended, materialize it.
+		if !isSuspended(t, lbp) {
+			continue
+		}
+
+		err := enableBreakpointOnTarget(t, lbp)
+		if err != nil {
+			logger.Debugf("could not enable breakpoint %d: %v", lbp.LogicalID, err)
+			continue
+		}
+
+		logger.Debugf("suspended breakpoint %d enabled", lbp.LogicalID)
+
+		// Notify the client.
+		if fn := t.BinInfo().eventsFn; fn != nil {
+			fn(&Event{
+				Kind: EventBreakpointMaterialized,
+				BreakpointMaterializedEventDetails: &BreakpointMaterializedEventDetails{
+					Breakpoint: lbp,
+				},
+			})
 		}
 	}
 	return false, nil

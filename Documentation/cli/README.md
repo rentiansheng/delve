@@ -88,7 +88,7 @@ Command | Description
 [exit](#exit) | Exit the debugger.
 [funcs](#funcs) | Print list of functions.
 [help](#help) | Prints the help message.
-[libraries](#libraries) | List loaded dynamic libraries
+[libraries](#libraries) | List loaded dynamic libraries.
 [list](#list) | Show source code.
 [packages](#packages) | Print list of packages.
 [source](#source) | Executes a file containing a list of delve commands
@@ -211,7 +211,7 @@ Set breakpoint condition.
 
 Specifies that the breakpoint, tracepoint or watchpoint should break only if the boolean expression is true.
 
-See [Documentation/cli/expr.md](//github.com/go-delve/delve/tree/master/Documentation/cli/expr.md) for a description of supported expressions.
+See [Documentation/cli/expr.md](//github.com/go-delve/delve/tree/master/Documentation/cli/expr.md) for a description of supported expressions and [Documentation/cli/cond.md](//github.com/go-delve/delve/tree/master/Documentation/cli/cond.md) for a description of how breakpoint conditions are evaluated.
 
 With the -hitcount option a condition on the breakpoint hit count can be set, the following operators are supported
 
@@ -483,7 +483,7 @@ GROUPING
 	goloc: groups goroutines by the location of the go instruction that created the goroutine
 	startloc: groups goroutines by the location of the start function
 	running: groups goroutines by whether they are running or not
-	user: groups goroutines by weather they are user or runtime goroutines
+	user: groups goroutines by whether they are user or runtime goroutines
 
 
 Groups goroutines by the given location, running status or user classification, up to 5 goroutines per group will be displayed as well as the total number of goroutines in the group.
@@ -511,7 +511,11 @@ Type "help" followed by the name of a command for more information about it.
 Aliases: h
 
 ## libraries
-List loaded dynamic libraries
+List loaded dynamic libraries.
+	
+	libraries [-d N]
+
+If used with the -d option it will re-attempt to download the debug symbols for library N, using debuginfod-find.
 
 
 ## list

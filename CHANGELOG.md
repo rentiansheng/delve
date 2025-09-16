@@ -3,6 +3,101 @@
 All notable changes to this project will be documented in this file.
 This project adheres to Semantic Versioning.
 
+## [1.25.2] 2025-08-26
+
+### Added
+
+* Added notifications for debuginfod downloads (#3980, @aarzilli)
+
+### Fixed
+
+* Fixed restart behavior of DAP server (#4068, @derekparker)
+* Various fixes for loong64 backend (#4095, #4100, @yelvens)
+* Miscellaneous minor bug fixes (#4067, #4090, #4089, @aarzilli)
+
+### Changed
+
+* Miscellaneous code quality improvements (#4088, @cui)
+
+## [1.25.1] 2025-07-18
+
+### Added
+- Implement restart request for DAP (#4057, @derekparker)
+
+### Fixed
+- Fixed panic when trying to stacktrace an unreadable goroutine in DAP (#4056, @aarzilli)
+- Fixed panic when trying to access value of unreadable string variables in DAP (#4055, @aarzilli)
+- Fixed type cast between slices with the same element type (#4048, @aarzilli)
+- Fixed closure captured variables visibility on closure's first line (#4049, @aarzilli)
+- Fixed unknown DWARF opcodes causing panics (#4037, @aarzilli)
+- Added missing response body close in DAP test (#4039, @alexandear)
+- Fix panic in switchToGoroutineStacktrace (#4043, @derekparker)
+
+### Changed
+- Handle moving of direct interface flag in Go 1.26 (#4032, @randall77)
+- Simplified tests using slices.Contains (#4040, @alexandear)
+- Updated Go max support minor version and update golang.org/x/tools (#4046, @derekparker)
+
+## [1.25.0] 2025-04-16
+
+### Added
+- Go 1.25 support (#4014, @aarzilli) (more work went into the 1.24.2 and earlier releases)
+
+### Fixed
+- Fixed several panics found via telemetry (#4026, #4018, #4017, #4015 @aarzilli)
+- Fixed git hash in version output (#3987, @codeaucafe)
+- Fix development version parsing (#3999, @aarzilli)
+- Fix call injection in newer macOS versions (#3988, @aarzilli)
+- Fix typo in goroutines help output (#4024, @jersey1dev)
+
+### Changed
+- Internal breakpoints (panic, throw) are excluded from DAP response (#4027, @ConradIrwin)
+
+## [1.24.2] 2025-04-10
+
+### Added
+
+- Support for struct literals in expression evaluator (#3935, #3953, @aarzilli)
+- Check to reject DWARFv5 executables if delve itself isn't built with 1.25 or later due to bugs in Go's standard library prior to 1.25 (#3943, #3961, @aarzilli)
+
+### Fixed
+
+- Support for macOS Sequoia 15.4 (#3966, @aarzilli)
+- Race conditions with rr backend (#3971, #3973, #3963, @BronzeDeer, @aarzilli)
+- Goroutine load with corrupted label maps (#3968, #3962, @hongyuh-hh)
+- Breakpoint conditions on suspended breakpoints (#3938, @Lslightly)
+
+### Changed
+
+- Miscellaneous test and documentation fixes (#3979, #3952, #3954, #3955, #3951, @alexandear, @codesoap, @derekparker)
+
+## [1.24.1] 2025-03-05
+
+### Added
+
+- Support for linux/loong64 in native backend (#3892, @yelvens)
+- Support for watchpoints on interface values (#3922, #3924, @derekparker)
+- Improved support for DWARFv5 (#3893, @aarzilli)
+- Telemetry stack counters for internal errors (#3930, @aarzilli)
+- Support for zed editor and allow args in DELVE_EDITOR (#3899, @derekparker)
+
+### Fixed
+
+- Fix uprobe address in ebpf implementation (#3894, @3u13r)
+- Provide process events after launch in DAP (#3902, @shaunduncan)
+- Use rr version to determine style of qRRCmd (#3921, @aarzilli)
+- Better error message for breakpoints on stripped binaries (#3914, @aarzilli)
+- Switch to goroutine stack if no progress on thread stack (#3898, @aarzilli)
+- Handle wider registers in test (#3929, @derekparker)
+
+### Changed
+
+- Replace logrus with log/slog (#3918, @aarzilli)
+- Remove uses of reflect.MethodByName from all of Delve (#3916, @aarzilli)
+- Refactor sort.Sort to slices.SortFunc (#3880, @alexandear)
+- Allow access to thread registers after a function call (#3908, @aarzilli)
+- Remove riscv64 from TeamCity configuration (#3912, @aarzilli)
+
 ## [1.24.0] 2024-12-18
 
 ### Added
@@ -764,7 +859,7 @@ Deprecation notice: starting with the next version of Delve version 1 of the API
 - Ability to read goroutine ancestors if they are enabled by passing `GODEBUG="tracebackancestors=N"` (requires Go >= 1.11) (#1514, #1570, @aarzilli)
 - Breakpoint autocompletion for the command line client (#1612, @qingyunha)
 - Added reverse step-instruction command for rr backend (#1596, @dpapastamos)
-- Support debugging programs using plugins on Linux with Go 1.12 or later (#1413, #1414, @aarzilli) 
+- Support debugging programs using plugins on Linux with Go 1.12 or later (#1413, #1414, @aarzilli)
 - Improved function call injection (#1503, #1504, #1548, #1591, #1602, @aarzilli)
 - New variable flag to mark variables that have a fake or no-longer-valid address, because they are either stored in registers or in a stack frame that has been removed from the stack (#1619, @aarzilli)
 - Support relative file paths when specifying breakpoint locations (#1478, @chainhelen)

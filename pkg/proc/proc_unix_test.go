@@ -56,7 +56,7 @@ func TestIssue419(t *testing.T) {
 		errChan <- grp.Continue()
 	})
 
-	for i := 0; i < 2; i++ {
+	for range 2 {
 		err := <-errChan
 
 		t.Logf("error %T %#v\n", err, err)
@@ -80,7 +80,7 @@ func TestSignalDeath(t *testing.T) {
 	if buildMode == "pie" {
 		buildFlags |= protest.BuildModePIE
 	}
-	fixture := protest.BuildFixture("loopprog", buildFlags)
+	fixture := protest.BuildFixture(t, "loopprog", buildFlags)
 	cmd := exec.Command(fixture.Path)
 	stdout, err := cmd.StdoutPipe()
 	assertNoError(err, t, "StdoutPipe")

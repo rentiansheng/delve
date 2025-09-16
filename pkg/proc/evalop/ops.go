@@ -214,6 +214,12 @@ type Roll struct {
 
 func (*Roll) depthCheck() (npop, npush int) { return 1, 1 }
 
+// Dup duplicates the topmost stack entry
+type Dup struct {
+}
+
+func (*Dup) depthCheck() (npop, npush int) { return 1, 2 }
+
 // BuiltinCall pops len(Args) argument from the stack, calls the specified
 // builtin on them and pushes the result back on the stack.
 type BuiltinCall struct {
@@ -285,6 +291,8 @@ type CallInjectionStartSpecial struct {
 	id     int
 	FnName string
 	ArgAst []ast.Expr
+
+	ComplainAboutStringAlloc bool // if this call injection can not be made complain specifically about string allocation
 }
 
 func (*CallInjectionStartSpecial) depthCheck() (npop, npush int) { return 0, 1 }
@@ -324,3 +332,26 @@ type PushPinAddress struct {
 }
 
 func (*PushPinAddress) depthCheck() (npop, npush int) { return 0, 1 }
+
+// PushBreakpointHitCount pushes a special array containing the hit counts
+// of breakpoints.
+type PushBreakpointHitCount struct {
+}
+
+func (*PushBreakpointHitCount) depthCheck() (npop, npush int) { return 0, 1 }
+
+// PushRuntimeType pushes the *runtime._type corresponding to the
+// godwarf.Type.
+type PushRuntimeType struct {
+	Type godwarf.Type
+}
+
+func (*PushRuntimeType) depthCheck() (npop, npush int) { return 0, 1 }
+
+// PushNewFakeVariable pushes a new debugger-allocated variable on to the
+// stack with the given type.
+type PushNewFakeVariable struct {
+	Type godwarf.Type
+}
+
+func (*PushNewFakeVariable) depthCheck() (npop, npush int) { return 0, 1 }

@@ -12,6 +12,8 @@ import (
 	"syscall"
 
 	"github.com/go-delve/delve/pkg/config"
+	"github.com/go-delve/delve/pkg/goversion"
+	"github.com/go-delve/delve/pkg/logflags"
 	"github.com/go-delve/delve/pkg/proc"
 )
 
@@ -139,6 +141,7 @@ func Replay(tracedir string, quiet, deleteOnDetach bool, debugInfoDirs []string,
 	if err := checkRRAvailable(); err != nil {
 		return nil, err
 	}
+	rrVersion := getRRVersion()
 
 	args := []string{
 		"replay",
@@ -175,6 +178,7 @@ func Replay(tracedir string, quiet, deleteOnDetach bool, debugInfoDirs []string,
 	p := newProcess(rrcmd.Process)
 	p.tracedir = tracedir
 	p.conn.useXcmd = true // 'rr' does not support the 'M' command which is what we would usually use to write memory, this is only important during function calls, in any other situation writing memory will fail anyway.
+	p.conn.newRRCmdStyle = rrVersion.AfterOrEqual(goversion.GoVersion{Major: 5, Minor: 8, Rev: 0})
 	if deleteOnDetach {
 		p.onDetach = func() {
 			safeRemoveAll(p.tracedir)
@@ -307,12 +311,12 @@ func rrParseGdbCommand(line string) rrInit {
 }
 
 // RecordAndReplay acts like calling Record and then Replay.
-func RecordAndReplay(cmd []string, wd string, quiet bool, debugInfoDirs []string, stdin string, stdout proc.OutputRedirect, stderr proc.OutputRedirect) (*proc.TargetGroup, string, error) {
+func RecordAndReplay(cmd []string, wd string, quiet bool, rrCleanup bool, debugInfoDirs []string, stdin string, stdout proc.OutputRedirect, stderr proc.OutputRedirect) (*proc.TargetGroup, string, error) {
 	tracedir, err := Record(cmd, wd, quiet, stdin, stdout, stderr)
 	if tracedir == "" {
 		return nil, "", err
 	}
-	t, err := Replay(tracedir, quiet, true, debugInfoDirs, 0, strings.Join(cmd, " "))
+	t, err := Replay(tracedir, quiet, rrCleanup, debugInfoDirs, 0, strings.Join(cmd, " "))
 	return t, tracedir, err
 }
 
@@ -334,4 +338,31 @@ func safeRemoveAll(dir string) {
 		}
 	}
 	os.Remove(dir)
+}
+
+func getRRVersion() goversion.GoVersion {
+	const rrVersionStringPrefix = "rr version "
+	buf, err := exec.Command("rr", "--version").CombinedOutput()
+	if err != nil {
+		return goversion.GoVersion{}
+	}
+	rest, ok := strings.CutPrefix(string(buf), rrVersionStringPrefix)
+	if !ok {
+		logflags.GdbWireLogger().Errorf("error reading rr version, prefix not found in %q", string(buf))
+		return goversion.GoVersion{}
+	}
+	rest = strings.TrimSpace(rest)
+	v := strings.Split(rest, ".")
+	if len(v) < 3 {
+		logflags.GdbWireLogger().Errorf("error reading rr version, not long enough %q", string(buf))
+		return goversion.GoVersion{}
+	}
+	major, majorerr := strconv.Atoi(v[0])
+	minor, minorerr := strconv.Atoi(v[1])
+	patch, patcherr := strconv.Atoi(v[2])
+	if majorerr != nil || minorerr != nil || patcherr != nil {
+		logflags.GdbWireLogger().Errorf("error reading rr version %v %v %v", majorerr, minorerr, patcherr)
+		return goversion.GoVersion{}
+	}
+	return goversion.GoVersion{Major: major, Minor: minor, Rev: patch}
 }

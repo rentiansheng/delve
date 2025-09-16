@@ -42,7 +42,7 @@ func assertNoError(err error, t testing.TB, s string) {
 func TestSplicedReader(t *testing.T) {
 	data := []byte{}
 	data2 := []byte{}
-	for i := 0; i < 100; i++ {
+	for i := range 100 {
 		data = append(data, byte(i))
 		data2 = append(data2, byte(i+100))
 	}
@@ -133,6 +133,7 @@ func TestSplicedReader(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
 			mem := &SplicedMemory{}
 			for _, region := range test.regions {
 				r := bytes.NewReader(region.data)
@@ -205,7 +206,7 @@ func withCoreFile(t *testing.T, name, args string) *proc.TargetGroup {
 	if buildMode == "pie" {
 		buildFlags = test.BuildModePIE
 	}
-	fix := test.BuildFixture(name, buildFlags)
+	fix := test.BuildFixture(t, name, buildFlags)
 	bashCmd := fmt.Sprintf("cd %v && ulimit -c unlimited && GOTRACEBACK=crash %v %s", tempDir, fix.Path, args)
 	exec.Command("bash", "-c", bashCmd).Run()
 	cores, err := filepath.Glob(path.Join(tempDir, "core*"))
@@ -219,7 +220,7 @@ func withCoreFile(t *testing.T, name, args string) *proc.TargetGroup {
 			t.Skipf("core file was not produced, could not run test, coredumpctl error: %v", err)
 			return nil
 		}
-		test.PathsToRemove = append(test.PathsToRemove, cores[0])
+		test.AddPathToRemove(cores[0])
 	}
 	corePath := cores[0]
 
@@ -249,15 +250,10 @@ func logRegisters(t *testing.T, regs proc.Registers, arch *proc.Arch) {
 }
 
 func TestCore(t *testing.T) {
-	if runtime.GOOS != "linux" || runtime.GOARCH == "386" {
-		t.Skip("unsupported")
-	}
-	if runtime.GOOS != "linux" || runtime.GOARCH == "loong64" {
-		t.Skip("could not read runtime.sigtrampgo context")
-	}
-	if runtime.GOOS == "linux" && os.Getenv("CI") == "true" && buildMode == "pie" {
-		t.Skip("disabled on linux, Github Actions, with PIE buildmode")
-	}
+	t.Parallel()
+
+	mustSupportCore(t)
+
 	grp := withCoreFile(t, "panic", "")
 	p := grp.Selected
 
@@ -322,6 +318,7 @@ func TestCore(t *testing.T) {
 }
 
 func TestCoreFpRegisters(t *testing.T) {
+	t.Parallel()
 	if runtime.GOOS != "linux" || runtime.GOARCH == "386" {
 		t.Skip("unsupported")
 	}
@@ -412,15 +409,9 @@ func TestCoreFpRegisters(t *testing.T) {
 }
 
 func TestCoreWithEmptyString(t *testing.T) {
-	if runtime.GOOS != "linux" || runtime.GOARCH == "386" {
-		t.Skip("unsupported")
-	}
-	if runtime.GOOS != "linux" || runtime.GOARCH == "loong64" {
-		t.Skip("could not read runtime.sigtrampgo context")
-	}
-	if runtime.GOOS == "linux" && os.Getenv("CI") == "true" && buildMode == "pie" {
-		t.Skip("disabled on linux, Github Actions, with PIE buildmode")
-	}
+	t.Parallel()
+	mustSupportCore(t)
+
 	grp := withCoreFile(t, "coreemptystring", "")
 	p := grp.Selected
 
@@ -457,6 +448,7 @@ mainSearch:
 }
 
 func TestMinidump(t *testing.T) {
+	t.Parallel()
 	if runtime.GOOS != "windows" || runtime.GOARCH != "amd64" {
 		t.Skip("minidumps can only be produced on windows/amd64")
 	}
@@ -464,7 +456,7 @@ func TestMinidump(t *testing.T) {
 	if buildMode == "pie" {
 		buildFlags = test.BuildModePIE
 	}
-	fix := test.BuildFixture("sleep", buildFlags)
+	fix := test.BuildFixture(t, "sleep", buildFlags)
 	mdmpPath := procdump(t, fix.Path)
 
 	grp, err := OpenCore(mdmpPath, fix.Path, []string{})
@@ -528,11 +520,28 @@ func procdump(t *testing.T, exePath string) string {
 		t.Logf("\t%s", name)
 		if strings.HasPrefix(name, exeName) && strings.HasSuffix(name, ".dmp") {
 			mdmpPath := filepath.Join(exeDir, name)
-			test.PathsToRemove = append(test.PathsToRemove, mdmpPath)
+			test.AddPathToRemove(mdmpPath)
 			return mdmpPath
 		}
 	}
 
 	t.Fatalf("could not find dump file")
 	return ""
+}
+
+func mustSupportCore(t *testing.T) {
+	t.Helper()
+
+	if runtime.GOOS != "linux" {
+		t.Skip("test must be run on linux")
+	}
+
+	switch runtime.GOARCH {
+	case "386", "ppc64le":
+		t.Skip("unsupported")
+	}
+
+	if os.Getenv("CI") == "true" && buildMode == "pie" {
+		t.Skip("disabled on linux, Github Actions, with PIE buildmode")
+	}
 }

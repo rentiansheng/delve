@@ -157,6 +157,7 @@ type Config struct {
 	DisableASLR bool
 
 	RrOnProcessPid int
+	RrDelOnDetach  bool
 }
 
 // New creates a new Debugger. ProcessArgs specify the commandline arguments for the
@@ -192,13 +193,14 @@ func New(config *Config, processArgs []string) (*Debugger, error) {
 			err = noDebugErrorWarning(err)
 			return nil, attachErrorMessage(d.config.AttachPid, err)
 		}
+		d.config.AttachPid = d.target.Selected.Pid()
 
 	case d.config.CoreFile != "":
 		var err error
 		switch d.config.Backend {
 		case "rr":
 			d.log.Infof("opening trace %s", d.config.CoreFile)
-			d.target, err = gdbserial.Replay(d.config.CoreFile, false, false, d.config.DebugInfoDirectories, d.config.RrOnProcessPid, "")
+			d.target, err = gdbserial.Replay(d.config.CoreFile, false, d.config.RrDelOnDetach, d.config.DebugInfoDirectories, d.config.RrOnProcessPid, "")
 		default:
 			d.log.Infof("opening core file %s (executable %s)", d.config.CoreFile, d.processArgs[0])
 			d.target, err = core.OpenCore(d.config.CoreFile, d.processArgs[0], d.config.DebugInfoDirectories)
@@ -254,7 +256,8 @@ func (d *Debugger) checkGoVersion() error {
 	if producer == "" {
 		return nil
 	}
-	return goversion.Compatible(producer, !d.config.CheckGoVersion)
+	dwarfVer := d.target.Selected.BinInfo().DwarfVersion()
+	return goversion.Compatible(dwarfVer, producer, !d.config.CheckGoVersion)
 }
 
 func (d *Debugger) TargetGoVersion() string {
@@ -357,7 +360,7 @@ func (d *Debugger) recordingRun(run func() (string, error)) (*proc.TargetGroup, 
 		return nil, err
 	}
 
-	return gdbserial.Replay(tracedir, false, true, d.config.DebugInfoDirectories, 0, strings.Join(d.processArgs, " "))
+	return gdbserial.Replay(tracedir, false, d.config.RrDelOnDetach, d.config.DebugInfoDirectories, 0, strings.Join(d.processArgs, " "))
 }
 
 // Attach will attach to the process specified by 'pid'.
@@ -776,9 +779,9 @@ func (d *Debugger) CreateBreakpoint(requestedBp *api.Breakpoint, locExpr string,
 	lbp.Set = setbp
 
 	if lbp.Set.Expr != nil {
-		addrs := lbp.Set.Expr(d.Target())
+		addrs := lbp.Set.Expr(d.target.Selected)
 		if len(addrs) > 0 {
-			f, l, fn := d.Target().BinInfo().PCToLine(addrs[0])
+			f, l, fn := d.target.Selected.BinInfo().PCToLine(addrs[0])
 			lbp.File = f
 			lbp.Line = l
 			if fn != nil {
@@ -913,10 +916,16 @@ func (d *Debugger) ClearBreakpoint(requestedBp *api.Breakpoint) (*api.Breakpoint
 			return nil, ErrNotImplementedWithMultitarget
 		}
 		bp := d.target.Selected.Breakpoints().M[requestedBp.Addr]
+		if bp == nil {
+			return nil, fmt.Errorf("no breakpoint at address %#x", requestedBp.Addr)
+		}
 		requestedBp.ID = bp.LogicalID()
 	}
 
 	lbp := d.target.LogicalBreakpoints[requestedBp.ID]
+	if lbp == nil {
+		return nil, fmt.Errorf("no breakpoint with ID %d", requestedBp.ID)
+	}
 	clearedBp := d.convertBreakpoint(lbp)
 
 	err := d.target.SetBreakpointEnabled(lbp, false)
@@ -988,6 +997,9 @@ func (d *Debugger) findBreakpointByName(name string) *api.Breakpoint {
 
 // CreateWatchpoint creates a watchpoint on the specified expression.
 func (d *Debugger) CreateWatchpoint(goid int64, frame, deferredCall int, expr string, wtype api.WatchType) (*api.Breakpoint, error) {
+	d.targetMutex.Lock()
+	defer d.targetMutex.Unlock()
+
 	p := d.target.Selected
 
 	s, err := proc.ConvertEvalScope(p, goid, frame, deferredCall)
@@ -1055,7 +1067,7 @@ func (d *Debugger) IsRunning() bool {
 }
 
 // Command handles commands which control the debugger lifecycle
-func (d *Debugger) Command(command *api.DebuggerCommand, resumeNotify chan struct{}, clientStatusCh chan struct{}) (state *api.DebuggerState, err error) {
+func (d *Debugger) Command(command *api.DebuggerCommand, resumeNotify chan struct{}, clientStatusCh chan struct{}, eventsFn func(*proc.Event)) (state *api.DebuggerState, err error) {
 	if command.Name == api.Halt {
 		// RequestManualStop does not invoke any ptrace syscalls, so it's safe to
 		// access the process directly.
@@ -1081,8 +1093,16 @@ func (d *Debugger) Command(command *api.DebuggerCommand, resumeNotify chan struc
 	d.setRunning(true)
 	defer d.setRunning(false)
 
+	d.target.SetEventsFn(nil)
 	if command.Name != api.SwitchGoroutine && command.Name != api.SwitchThread && command.Name != api.Halt {
 		d.target.ResumeNotify(resumeNotify)
+
+		if eventsFn != nil {
+			eventsFn(&proc.Event{Kind: proc.EventResumed})
+			defer eventsFn(&proc.Event{Kind: proc.EventStopped})
+		}
+
+		d.target.SetEventsFn(eventsFn)
 	} else if resumeNotify != nil {
 		close(resumeNotify)
 	}
@@ -1489,36 +1509,31 @@ func (d *Debugger) PackageVariables(filter string, cfg proc.LoadConfig) ([]*proc
 }
 
 // ThreadRegisters returns registers of the specified thread.
-func (d *Debugger) ThreadRegisters(threadID int) (*op.DwarfRegisters, error) {
+func (d *Debugger) ThreadRegisters(threadID int) (*op.DwarfRegisters, proc.DwarfRegisterToStringFunc, error) {
 	d.targetMutex.Lock()
 	defer d.targetMutex.Unlock()
 
 	thread, found := d.target.Selected.FindThread(threadID)
 	if !found {
-		return nil, fmt.Errorf("couldn't find thread %d", threadID)
+		return nil, nil, fmt.Errorf("couldn't find thread %d", threadID)
 	}
 	regs, err := thread.Registers()
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return d.target.Selected.BinInfo().Arch.RegistersToDwarfRegisters(0, regs), nil
+	return d.target.Selected.BinInfo().Arch.RegistersToDwarfRegisters(0, regs), d.target.Selected.BinInfo().Arch.DwarfRegisterToString, nil
 }
 
 // ScopeRegisters returns registers for the specified scope.
-func (d *Debugger) ScopeRegisters(goid int64, frame, deferredCall int) (*op.DwarfRegisters, error) {
+func (d *Debugger) ScopeRegisters(goid int64, frame, deferredCall int) (*op.DwarfRegisters, proc.DwarfRegisterToStringFunc, error) {
 	d.targetMutex.Lock()
 	defer d.targetMutex.Unlock()
 
 	s, err := proc.ConvertEvalScope(d.target.Selected, goid, frame, deferredCall)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return &s.Regs, nil
-}
-
-// DwarfRegisterToString returns the name and value representation of the given register.
-func (d *Debugger) DwarfRegisterToString(i int, reg *op.DwarfRegister) (string, bool, string) {
-	return d.target.Selected.BinInfo().Arch.DwarfRegisterToString(i, reg)
+	return &s.Regs, d.target.Selected.BinInfo().Arch.DwarfRegisterToString, nil
 }
 
 // LocalVariables returns a list of the local variables.
@@ -1889,7 +1904,7 @@ func (d *Debugger) CurrentPackage() (string, error) {
 	if _, err := d.target.Valid(); err != nil {
 		return "", err
 	}
-	loc, err := d.target.Selected.CurrentThread().Location()
+	loc, err := proc.ThreadLocation(d.target.Selected.CurrentThread())
 	if err != nil {
 		return "", err
 	}
@@ -1943,7 +1958,7 @@ func (d *Debugger) findLocation(goid int64, frame, deferredCall int, locStr stri
 		if s1 != "" {
 			subst = s1
 		}
-		if err != nil {
+		if err != nil && !errors.As(err, new(*locspec.ErrLocationNotFound)) {
 			return nil, "", err
 		}
 		for i := range locs {
@@ -1960,6 +1975,9 @@ func (d *Debugger) findLocation(goid int64, frame, deferredCall int, locStr stri
 			}
 		}
 		locations = append(locations, locs...)
+	}
+	if len(locations) == 0 {
+		return locations, subst, &locspec.ErrLocationNotFound{Spec: locStr}
 	}
 	return locations, subst, nil
 }
@@ -2132,14 +2150,10 @@ func (d *Debugger) StopReason() proc.StopReason {
 	return d.target.Selected.StopReason
 }
 
-// LockTarget acquires the target mutex.
-func (d *Debugger) LockTarget() {
+// LockTargetGroup locks the target group and returns a function to unlock it.
+func (d *Debugger) LockTargetGroup() (*proc.TargetGroup, func()) {
 	d.targetMutex.Lock()
-}
-
-// UnlockTarget releases the target mutex.
-func (d *Debugger) UnlockTarget() {
-	d.targetMutex.Unlock()
+	return d.target, d.targetMutex.Unlock
 }
 
 // DumpStart starts a core dump to dest.
@@ -2215,16 +2229,10 @@ func (d *Debugger) DumpCancel() error {
 	return nil
 }
 
-func (d *Debugger) Target() *proc.Target {
-	return d.target.Selected
-}
-
-func (d *Debugger) TargetGroup() *proc.TargetGroup {
-	return d.target
-}
-
 func (d *Debugger) BuildID() string {
-	loc, err := d.target.Selected.CurrentThread().Location()
+	d.targetMutex.Lock()
+	defer d.targetMutex.Unlock()
+	loc, err := proc.ThreadLocation(d.target.Selected.CurrentThread())
 	if err != nil {
 		return ""
 	}
@@ -2445,6 +2453,8 @@ func (d *Debugger) maybePrintUnattendedStopWarning(stopReason proc.StopReason, c
 // server paths to client paths by examining the executable file and a map
 // of module paths to client directories (clientMod2Dir) passed as input.
 func (d *Debugger) GuessSubstitutePath(args *api.GuessSubstitutePathIn) map[string]string {
+	d.targetMutex.Lock()
+	defer d.targetMutex.Unlock()
 	bis := []*proc.BinaryInfo{}
 	bins := [][]proc.Function{}
 	tgt := proc.ValidTargets{Group: d.target}
@@ -2457,6 +2467,21 @@ func (d *Debugger) GuessSubstitutePath(args *api.GuessSubstitutePathIn) map[stri
 		file, _ := bis[biIdx].EntryLineForFunc(fn)
 		return file
 	})
+}
+
+// CancelDownloads cancels ongoing downloads, if any.
+func (d *Debugger) CancelDownloads() bool {
+	if d.isRecording() {
+		return false
+	}
+	return d.target.CancelDownloads()
+}
+
+// DownloadLibraryDebugInfo attempts to download the specified library's debug info.
+func (d *Debugger) DownloadLibraryDebugInfo(n int) error {
+	d.targetMutex.Lock()
+	defer d.targetMutex.Unlock()
+	return d.target.Selected.BinInfo().LoadImageBinaryInfoAgain(n)
 }
 
 func guessSubstitutePath(args *api.GuessSubstitutePathIn, bins [][]proc.Function, fileForFunc func(int, *proc.Function) string) map[string]string {
@@ -2560,7 +2585,7 @@ func guessSubstitutePath(args *api.GuessSubstitutePathIn, bins [][]proc.Function
 			if slashes(dir) < elems {
 				continue
 			}
-			for i := 0; i < elems; i++ {
+			for range elems {
 				dir = path.Dir(dir)
 			}
 

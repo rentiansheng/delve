@@ -293,15 +293,23 @@ func (it *stackIterator) Next() bool {
 	return true
 }
 
-func (it *stackIterator) switchToGoroutineStack() {
+func (it *stackIterator) switchToGoroutineStack() error {
+	if it.g == nil {
+		return fmt.Errorf("nil goroutine when attempting to switch to goroutine stack")
+	}
 	it.systemstack = false
 	it.top = false
 	it.pc = it.g.PC
 	it.regs.Reg(it.regs.SPRegNum).Uint64Val = it.g.SP
 	it.regs.AddReg(it.regs.BPRegNum, op.DwarfRegisterFromUint64(it.g.BP))
-	if it.bi.Arch.Name == "arm64" || it.bi.Arch.Name == "ppc64le" || it.bi.Arch.Name == "riscv64" || it.bi.Arch.Name == "loong64" {
-		it.regs.Reg(it.regs.LRRegNum).Uint64Val = it.g.LR
+	if it.bi.Arch.usesLR {
+		lrReg := it.regs.Reg(it.regs.LRRegNum)
+		if lrReg == nil {
+			return fmt.Errorf("LR register is nil during stack switch")
+		}
+		lrReg.Uint64Val = it.g.LR
 	}
+	return nil
 }
 
 // Frame returns the frame the iterator is pointing at.
@@ -413,7 +421,10 @@ func (it *stackIterator) stacktrace(depth int) ([]Stackframe, error) {
 
 func (it *stackIterator) stacktraceFunc(callback func(Stackframe) bool) {
 	if it.opts&StacktraceG != 0 && it.g != nil {
-		it.switchToGoroutineStack()
+		if err := it.switchToGoroutineStack(); err != nil {
+			it.err = err
+			return
+		}
 		it.top = true
 	}
 	for it.Next() {
@@ -497,15 +508,19 @@ func (it *stackIterator) appendInlineCalls(callback func(Stackframe) bool, frame
 // it.regs.CFA; the caller has to eventually switch it.regs when the iterator
 // advances to the next frame.
 func (it *stackIterator) advanceRegs() (callFrameRegs op.DwarfRegisters, ret uint64, retaddr uint64) {
+	logger := logflags.StackLogger()
+
 	fde, err := it.bi.frameEntries.FDEForPC(it.pc)
 	var framectx *frame.FrameContext
 	if _, nofde := err.(*frame.ErrNoFDEForPC); nofde {
 		framectx = it.bi.Arch.fixFrameUnwindContext(nil, it.pc, it.bi)
 	} else {
-		framectx = it.bi.Arch.fixFrameUnwindContext(fde.EstablishFrame(it.pc), it.pc, it.bi)
+		fctxt, err := fde.EstablishFrame(it.pc)
+		if err != nil {
+			logger.Errorf("Error executing Frame Debug Entry for PC %x: %v", it.pc, err)
+		}
+		framectx = it.bi.Arch.fixFrameUnwindContext(fctxt, it.pc, it.bi)
 	}
-
-	logger := logflags.StackLogger()
 
 	logger.Debugf("advanceRegs at %#x", it.pc)
 
@@ -580,7 +595,7 @@ func (it *stackIterator) advanceRegs() (callFrameRegs op.DwarfRegisters, ret uin
 		}
 	}
 
-	if it.bi.Arch.Name == "arm64" || it.bi.Arch.Name == "ppc64le" || it.bi.Arch.Name == "riscv64" || it.bi.Arch.Name == "loong64" {
+	if it.bi.Arch.usesLR {
 		if ret == 0 && it.regs.Reg(it.regs.LRRegNum) != nil {
 			ret = it.regs.Reg(it.regs.LRRegNum).Uint64Val
 		}
